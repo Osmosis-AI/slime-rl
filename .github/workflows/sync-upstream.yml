@@ -1,0 +1,46 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily at 6am UTC
+  workflow_dispatch: # manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/THUDM/slime.git
+
+      - name: Fetch upstream
+        run: git fetch upstream main
+
+      - name: Merge upstream/main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git merge upstream/main --no-edit || {
+            echo "::warning::Merge conflict detected. Creating PR instead."
+            git merge --abort
+            git checkout -b sync/upstream-$(date +%Y%m%d)
+            git merge upstream/main --no-commit --no-ff || true
+            git add -A
+            git commit -m "sync: merge upstream THUDM/slime (conflicts)" || true
+            git push origin sync/upstream-$(date +%Y%m%d)
+            gh pr create \
+              --title "sync: merge upstream THUDM/slime (conflicts)" \
+              --body "Automatic upstream sync failed with merge conflicts. Please resolve manually." \
+              --base main \
+              --head sync/upstream-$(date +%Y%m%d)
+            exit 0
+          }
+
+      - name: Push
+        run: git push origin main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
