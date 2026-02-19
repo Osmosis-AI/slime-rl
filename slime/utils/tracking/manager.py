@@ -42,7 +42,7 @@ class WandbBackend(TrackingBackend):
     # Delegates to the existing ``wandb_utils`` helpers.
 
     def init(self, args, *, primary: bool = True, **kwargs) -> None:
-        from . import wandb_utils
+        from .. import wandb_utils
 
         if primary:
             wandb_utils.init_wandb_primary(args, **kwargs)
@@ -66,7 +66,7 @@ class TensorboardBackend(TrackingBackend):
     _adapter = None
 
     def init(self, args, *, primary: bool = True, **kwargs) -> None:
-        from .tensorboard_utils import _TensorboardAdapter
+        from ..tensorboard_utils import _TensorboardAdapter
 
         self._adapter = _TensorboardAdapter(args)
 
