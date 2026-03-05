@@ -37,9 +37,6 @@ setup(
     include_package_data=True,
     install_requires=_fetch_requirements("requirements.txt"),
     extras_require={
-        "fsdp": [
-            "torch>=2.0",
-        ],
         "mlflow": [
             "mlflow",
         ],
