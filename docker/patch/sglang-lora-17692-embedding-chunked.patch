@@ -1,0 +1,1294 @@
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index aff05bf42703..593de6e82a6e 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -403,6 +403,10 @@ def _get_pruned_states(
+         aux_hidden_states: Optional[torch.Tensor],
+         logits_metadata: LogitsMetadata,
+     ):
++        # NOTE: If you change the pruning conditions or per-sequence token
++        # counts below, you must also update get_lm_head_pruned_lens() in
++        # sglang/srt/lora/utils.py, which precomputes matching batch metadata
++        # for lm_head LoRA.
+         pruned_states_before_norm: Optional[torch.Tensor] = None
+         aux_pruned_states = None
+         token_to_seq_idx = []
+@@ -688,6 +692,12 @@ def process_input_logprobs_by_chunk(
+             start_idx = i * chunk_size
+             end_idx = min((i + 1) * chunk_size, total_size)
+ 
++            # Notify lm_head LoRA about the current chunk so it can swap
++            # to the precomputed per-chunk batch_info.  This is a no-op
++            # for non-LoRA lm_head modules.
++            if hasattr(lm_head, "set_lm_head_pass"):
++                lm_head.set_lm_head_pass(i)
++
+             # Get indices for this chunk
+             chunk_mask = (input_logprob_indices >= start_idx) & (
+                 input_logprob_indices < end_idx
+@@ -792,6 +802,10 @@ def process_input_logprobs_by_chunk(
+             ]
+             input_token_logprobs.append(chunk_input_token_logprobs)
+ 
++        # Restore the full-pruned lm_head batch_info after chunk iteration.
++        if hasattr(lm_head, "reset_lm_head_pass"):
++            lm_head.reset_lm_head_pass()
++
+         # Concatenate the results
+         input_token_logprobs = torch.cat(input_token_logprobs, dim=0)
+ 
+diff --git a/python/sglang/srt/lora/backend/base_backend.py b/python/sglang/srt/lora/backend/base_backend.py
+index 06e4e8ba5a95..8a3bf41ad361 100644
+--- a/python/sglang/srt/lora/backend/base_backend.py
++++ b/python/sglang/srt/lora/backend/base_backend.py
+@@ -1,7 +1,9 @@
+-from typing import Tuple, Union
++from typing import List, Optional, Tuple, Union
+ 
+ import torch
+ 
++from sglang.srt.environ import envs
++from sglang.srt.lora.utils import build_lm_head_pass_segments
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ 
+ 
+@@ -18,6 +20,14 @@ class BaseLoRABackend:
+     def __init__(self, max_loras_per_batch: int, device: torch.device):
+         self.max_loras_per_batch = max_loras_per_batch
+         self.device = device
++        self.lm_head_batch_info = None
++        # Precomputed per-pass lm_head batch_infos.  When the logits processor
++        # calls lm_head in multiple passes (chunked logprobs), each pass gets
++        # its own batch_info from this list.
++        self.lm_head_pass_batch_infos = None
++        # Current pass index.  When set, apply_lora uses
++        # lm_head_pass_batch_infos[idx] instead of lm_head_batch_info.
++        self._lm_head_pass_idx = None
+ 
+     def run_lora_a_embedding(
+         self,
+@@ -178,3 +188,30 @@ def prepare_lora_batch(
+             use_cuda_graph: whether to use CUDA Graph for this batch
+         """
+         pass
++
++    def _get_lm_head_pass_segments(
++        self,
++        weight_indices: list[int],
++        pruned_lens: List[int],
++    ) -> Optional[List[Tuple[List[int], List[int]]]]:
++        """Compute per-pass segment info for lm_head LoRA logprobs chunking.
++
++        When LogitsProcessor splits pruned states into fixed-size passes,
++        each pass needs its own segmentation so that lm_head LoRA operates
++        on the correct adapter assignments.  This method returns the generic
++        per-pass (seg_weight_indices, seg_lens) tuples; each backend is
++        responsible for converting them into backend-specific LoRABatchInfo.
++
++        Returns None if logprobs chunking is disabled or the pruned token
++        count does not exceed the logprobs chunk size.
++        """
++        logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
++        enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
++        pruned_total = sum(pruned_lens)
++
++        if not enable_logprobs_chunk or pruned_total <= logprobs_chunk_size:
++            return None
++
++        return build_lm_head_pass_segments(
++            weight_indices, pruned_lens, logprobs_chunk_size
++        )
+diff --git a/python/sglang/srt/lora/backend/chunked_backend.py b/python/sglang/srt/lora/backend/chunked_backend.py
+index 54b28a77192f..202ad5267d50 100644
+--- a/python/sglang/srt/lora/backend/chunked_backend.py
++++ b/python/sglang/srt/lora/backend/chunked_backend.py
+@@ -1,11 +1,20 @@
++import dataclasses
++from typing import List, Tuple
++
+ import torch
+ 
+ from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+ from sglang.srt.lora.triton_ops import (
++    chunked_embedding_lora_a_forward,
+     chunked_sgmv_lora_expand_forward,
+     chunked_sgmv_lora_shrink_forward,
+ )
+-from sglang.srt.lora.utils import LoRABatchInfo, generate_sequence_lengths
++from sglang.srt.lora.utils import (
++    LoRABatchInfo,
++    generate_sequence_lengths,
++    get_lm_head_pruned_lens,
++    merge_and_chunk_segments,
++)
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.server_args import ServerArgs
+ 
+@@ -33,13 +42,40 @@ def __init__(
+         super().__init__(max_loras_per_batch, device)
+         self.max_chunk_size = server_args.max_lora_chunk_size
+ 
++    def run_lora_a_embedding(
++        self,
++        input_ids: torch.Tensor,
++        weights: torch.Tensor,
++        vocab_size: int,
++        extra_embeddings: torch.Tensor = None,
++        *args,
++        **kwargs,
++    ) -> torch.Tensor:
++        assert (
++            extra_embeddings is None
++        ), "Extra embeddings for lora a is not supported yet in chunked backend"
++        return chunked_embedding_lora_a_forward(
++            input_ids=input_ids,
++            weights=weights,
++            batch_info=self.batch_info,
++            vocab_size=vocab_size,
++        )
++
+     def run_lora_a_sgemm(
+-        self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
++        self,
++        x: torch.Tensor,
++        weights: torch.Tensor,
++        pruned_batch_info: LoRABatchInfo = None,
++        *args,
++        **kwargs,
+     ) -> torch.Tensor:
++        batch_info = (
++            pruned_batch_info if pruned_batch_info is not None else self.batch_info
++        )
+         return chunked_sgmv_lora_shrink_forward(
+             x=x,
+             weights=weights,
+-            batch_info=self.batch_info,
++            batch_info=batch_info,
+             num_slices=1,
+         )
+ 
+@@ -49,16 +85,20 @@ def run_lora_b_sgemm(
+         weights: torch.Tensor,
+         output_offset: torch.Tensor,
+         base_output: torch.Tensor = None,
++        pruned_batch_info: LoRABatchInfo = None,
+         *args,
+         **kwargs,
+     ) -> torch.Tensor:
+         # For simple lora B, we use slice offsets [0, output_dim]
+         output_dim = weights.shape[-2]
+         max_slice_size = output_dim
++        batch_info = (
++            pruned_batch_info if pruned_batch_info is not None else self.batch_info
++        )
+         return chunked_sgmv_lora_expand_forward(
+             x=x,
+             weights=weights,
+-            batch_info=self.batch_info,
++            batch_info=batch_info,
+             slice_offsets=output_offset,
+             max_slice_size=max_slice_size,
+             base_output=base_output,
+@@ -141,15 +181,18 @@ def _determine_chunk_size(self, forward_batch: ForwardBatch) -> int:
+         Returns:
+             The determined chunk size
+         """
+-
+-        if self.max_chunk_size <= MIN_CHUNK_SIZE:
+-            return MIN_CHUNK_SIZE
+-
+         num_tokens = (
+             forward_batch.extend_num_tokens
+             if forward_batch.forward_mode.is_extend()
+             else forward_batch.batch_size
+         )
++        return self._determine_chunk_size_for_tokens(num_tokens)
++
++    def _determine_chunk_size_for_tokens(self, num_tokens: int) -> int:
++        """Determine chunk size given a token count directly."""
++        if self.max_chunk_size <= MIN_CHUNK_SIZE:
++            return MIN_CHUNK_SIZE
++
+         if num_tokens >= 256:
+             chunk_size = 128
+         elif num_tokens >= 64:
+@@ -254,6 +297,77 @@ def prepare_lora_batch(
+ 
+         self.batch_info = batch_info
+ 
++        # Precompute lm_head_batch_info for pruned lm_head LoRA
++        pruned_lens = get_lm_head_pruned_lens(forward_batch)
++
++        if pruned_lens is not None:
++            pruned_total = sum(pruned_lens)
++            chunk_size = self._determine_chunk_size_for_tokens(pruned_total)
++            lm_head_segments = merge_and_chunk_segments(
++                weight_indices, pruned_lens, chunk_size=chunk_size
++            )
++            self.lm_head_batch_info = self._build_lm_head_batch_info(
++                lm_head_segments, batch_info, chunk_size, pruned_total
++            )
++
++            # Precompute per-pass batch_infos for logprobs chunking
++            pass_segments = self._get_lm_head_pass_segments(weight_indices, pruned_lens)
++            if pass_segments is not None:
++                self.lm_head_pass_batch_infos = []
++                for seg_wi, seg_lens_list in pass_segments:
++                    pass_total = sum(seg_lens_list)
++                    pass_chunk_size = self._determine_chunk_size_for_tokens(pass_total)
++                    chunked_segments = merge_and_chunk_segments(
++                        seg_wi, seg_lens_list, chunk_size=pass_chunk_size
++                    )
++                    self.lm_head_pass_batch_infos.append(
++                        self._build_lm_head_batch_info(
++                            chunked_segments,
++                            batch_info,
++                            pass_chunk_size,
++                            pass_total,
++                        )
++                    )
++            else:
++                self.lm_head_pass_batch_infos = None
++        else:
++            self.lm_head_batch_info = None
++            self.lm_head_pass_batch_infos = None
++
++    def _build_lm_head_batch_info(
++        self,
++        lm_head_segments: Tuple[List[int], List[int]],
++        batch_info: LoRABatchInfo,
++        chunk_size: int,
++        expected_tokens: int,
++    ) -> LoRABatchInfo:
++        """Build a chunked LoRABatchInfo for pruned lm_head input."""
++        seg_weight_indices_cpu, seg_lens_cpu = lm_head_segments
++        pruned_total = sum(seg_lens_cpu)
++        num_segments = len(seg_weight_indices_cpu)
++
++        weight_indices = torch.tensor(
++            seg_weight_indices_cpu, dtype=torch.int32, device=self.device
++        )
++        seg_lens = torch.tensor(seg_lens_cpu, dtype=torch.int32, device=self.device)
++        seg_indptr = torch.zeros(
++            (num_segments + 1,), dtype=torch.int32, device=self.device
++        )
++        seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
++
++        # Identity permutation (lm_head tokens are in original order)
++        permutation = torch.arange(pruned_total, dtype=torch.int32, device=self.device)
++
++        return dataclasses.replace(
++            batch_info,
++            num_segments=num_segments,
++            max_len=chunk_size,
++            seg_indptr=seg_indptr,
++            weight_indices=weight_indices,
++            permutation=permutation,
++            expected_tokens=expected_tokens,
++        )
++
+     @staticmethod
+     def _get_permutation(seq_weight_indices, forward_batch: ForwardBatch):
+         """
+diff --git a/python/sglang/srt/lora/backend/triton_backend.py b/python/sglang/srt/lora/backend/triton_backend.py
+index ad79199fd27b..2bd48c0e9b00 100644
+--- a/python/sglang/srt/lora/backend/triton_backend.py
++++ b/python/sglang/srt/lora/backend/triton_backend.py
+@@ -1,3 +1,6 @@
++import dataclasses
++from typing import List, Tuple
++
+ import torch
+ 
+ from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+@@ -8,7 +11,11 @@
+     sgemm_lora_a_fwd,
+     sgemm_lora_b_fwd,
+ )
+-from sglang.srt.lora.utils import LoRABatchInfo
++from sglang.srt.lora.utils import (
++    LoRABatchInfo,
++    get_lm_head_pruned_lens,
++    merge_and_chunk_segments,
++)
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ 
+ 
+@@ -42,19 +49,31 @@ def run_lora_a_embedding(
+         )
+ 
+     def run_lora_a_sgemm(
+-        self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
++        self,
++        x: torch.Tensor,
++        weights: torch.Tensor,
++        pruned_batch_info: LoRABatchInfo = None,
++        *args,
++        **kwargs,
+     ) -> torch.Tensor:
+-        return sgemm_lora_a_fwd(x, weights, self.batch_info)
++        batch_info = (
++            pruned_batch_info if pruned_batch_info is not None else self.batch_info
++        )
++        return sgemm_lora_a_fwd(x, weights, batch_info)
+ 
+     def run_lora_b_sgemm(
+         self,
+         x: torch.Tensor,
+         weights: torch.Tensor,
+         base_output: torch.Tensor = None,
++        pruned_batch_info: LoRABatchInfo = None,
+         *args,
+         **kwargs,
+     ) -> torch.Tensor:
+-        return sgemm_lora_b_fwd(x, weights, self.batch_info, base_output)
++        batch_info = (
++            pruned_batch_info if pruned_batch_info is not None else self.batch_info
++        )
++        return sgemm_lora_b_fwd(x, weights, batch_info, base_output)
+ 
+     def run_qkv_lora(
+         self,
+@@ -214,3 +233,64 @@ def prepare_lora_batch(
+         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
+ 
+         self.batch_info = batch_info
++
++        # Precompute lm_head_batch_info for pruned lm_head LoRA
++        pruned_lens = get_lm_head_pruned_lens(forward_batch)
++
++        if pruned_lens is not None:
++            pruned_total = sum(pruned_lens)
++            lm_head_segments = merge_and_chunk_segments(
++                weight_indices, pruned_lens, chunk_size=pruned_total
++            )
++            self.lm_head_batch_info = self._build_lm_head_batch_info(
++                lm_head_segments, batch_info, pruned_total
++            )
++
++            # Precompute per-pass batch_infos for logprobs chunking
++            pass_segments = self._get_lm_head_pass_segments(weight_indices, pruned_lens)
++            if pass_segments is not None:
++                self.lm_head_pass_batch_infos = []
++                for seg_wi, seg_lens_list in pass_segments:
++                    pass_total = sum(seg_lens_list)
++                    merged_segments = merge_and_chunk_segments(
++                        seg_wi, seg_lens_list, chunk_size=pass_total
++                    )
++                    self.lm_head_pass_batch_infos.append(
++                        self._build_lm_head_batch_info(
++                            merged_segments, batch_info, pass_total
++                        )
++                    )
++            else:
++                self.lm_head_pass_batch_infos = None
++        else:
++            self.lm_head_batch_info = None
++            self.lm_head_pass_batch_infos = None
++
++    def _build_lm_head_batch_info(
++        self,
++        lm_head_segments: Tuple[List[int], List[int]],
++        batch_info: LoRABatchInfo,
++        expected_tokens: int,
++    ) -> LoRABatchInfo:
++        """Build a LoRABatchInfo for pruned lm_head input."""
++        seg_weight_indices_cpu, seg_lens_cpu = lm_head_segments
++        num_segments = len(seg_weight_indices_cpu)
++
++        seg_lens = torch.tensor(seg_lens_cpu, dtype=torch.int32, device=self.device)
++        seg_indptr = torch.zeros(
++            (num_segments + 1,), dtype=torch.int32, device=self.device
++        )
++        seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
++
++        return dataclasses.replace(
++            batch_info,
++            bs=num_segments,
++            num_segments=num_segments,
++            max_len=max(seg_lens_cpu),
++            seg_lens=seg_lens,
++            seg_indptr=seg_indptr,
++            weight_indices=torch.tensor(
++                seg_weight_indices_cpu, dtype=torch.int32, device=self.device
++            ),
++            expected_tokens=expected_tokens,
++        )
+diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
+index 498ab113c6ce..f9c66f3b0af6 100644
+--- a/python/sglang/srt/lora/layers.py
++++ b/python/sglang/srt/lora/layers.py
+@@ -240,8 +240,46 @@ def set_lora_info(
+         self.lm_head_A_buffer = lm_head_A_buffer  # (num_loras, rank, hidden_dim)
+         self.lm_head_B_buffer = lm_head_B_buffer  # (num_loras, vocab_size, rank)
+ 
++    def _get_lm_head_batch_info(self, num_tokens: int):
++        """Resolve and validate the active lm_head batch_info.
++
++        When the logits processor calls lm_head in multiple passes
++        (chunked logprobs), _lm_head_pass_idx selects a precomputed
++        per-pass batch_info.  Otherwise the full-pruned batch_info is used.
++
++        Returns None when no lm_head pruning applies (decode, no LoRA, etc.).
++        """
++        pass_idx = self.lora_backend._lm_head_pass_idx
++        if (
++            pass_idx is not None
++            and self.lora_backend.lm_head_pass_batch_infos is not None
++        ):
++            batch_info = self.lora_backend.lm_head_pass_batch_infos[pass_idx]
++        else:
++            batch_info = self.lora_backend.lm_head_batch_info
++
++        if batch_info is not None:
++            if batch_info.use_cuda_graph:
++                raise RuntimeError(
++                    "lm_head LoRA with pruned batch info is not supported "
++                    "under CUDA graph. lm_head pruning should only occur "
++                    "during extend, which does not use CUDA graph."
++                )
++            if num_tokens != batch_info.expected_tokens:
++                raise RuntimeError(
++                    f"lm_head LoRA input token count mismatch: got "
++                    f"{num_tokens} tokens but lm_head_batch_info expects "
++                    f"{batch_info.expected_tokens}. This likely means "
++                    f"a pruning step in LogitsProcessor._get_pruned_states is "
++                    f"not reflected in get_lm_head_pruned_lens()."
++                )
++
++        return batch_info
++
+     def apply_lora(
+-        self, base_output: torch.Tensor, hidden_states: torch.Tensor
++        self,
++        base_output: torch.Tensor,
++        hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
+         """
+         Apply LoRA to LM head layer.
+@@ -250,9 +288,13 @@ def apply_lora(
+                            = hidden @ W^T + hidden @ A^T @ B^T
+                            = base_output + (hidden @ A^T) @ B^T
+         """
++        lm_head_batch_info = self._get_lm_head_batch_info(hidden_states.shape[0])
++
+         # Apply lora_A^T: hidden_states @ A^T
+         lora_a_output = self.lora_backend.run_lora_a_sgemm(
+-            hidden_states, self.lm_head_A_buffer
++            hidden_states,
++            self.lm_head_A_buffer,
++            pruned_batch_info=lm_head_batch_info,
+         )
+ 
+         # Apply lora_B^T: lora_a_output @ B^T
+@@ -261,6 +303,7 @@ def apply_lora(
+             weights=self.lm_head_B_buffer,
+             output_offset=self.output_offset,
+             base_output=base_output,
++            pruned_batch_info=lm_head_batch_info,
+         )
+ 
+         return lora_output
+@@ -277,6 +320,23 @@ def forward(self, hidden_states: torch.Tensor):
+ 
+         return base_output
+ 
++    # ------------------------------------------------------------------
++    # Multi-pass lm_head support (chunked logprobs)
++    # ------------------------------------------------------------------
++
++    def set_lm_head_pass(self, pass_idx: int):
++        """Set the active lm_head pass index before a logprobs chunk.
++
++        Called by LogitsProcessor.process_input_logprobs_by_chunk() before
++        each chunk's _get_logits call.  _get_lm_head_batch_info() will
++        resolve to lm_head_pass_batch_infos[pass_idx].
++        """
++        self.lora_backend._lm_head_pass_idx = pass_idx
++
++    def reset_lm_head_pass(self):
++        """Reset the lm_head pass index after all passes are done."""
++        self.lora_backend._lm_head_pass_idx = None
++
+     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+         # For TP=1, no slicing needed
+         # For TP>1, need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 43216525551d..ede8b51be5e8 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -533,6 +533,22 @@ def load_lora_weight_tensor(
+                         :lora_rank,
+                     ]
+                     load_lora_weight_tensor(buffer_view, lora_b_weights)
++        else:
++            # Zero out embedding/lm_head buffers for adapters without embedding LoRA
++            # to avoid using garbage values from uninitialized memory
++            for k in self.embedding_A_buffer.keys():
++                self.embedding_A_buffer[k][buffer_id].zero_()
++            for k in self.embedding_B_buffer.keys():
++                self.embedding_B_buffer[k][buffer_id].zero_()
++            for k in self.lm_head_A_buffer.keys():
++                self.lm_head_A_buffer[k][buffer_id].zero_()
++            for k in self.lm_head_B_buffer.keys():
++                self.lm_head_B_buffer[k][buffer_id].zero_()
++            if (
++                self.lora_added_tokens_size > 0
++                and "input_embeddings" in self.new_embeddings_buffer
++            ):
++                self.new_embeddings_buffer["input_embeddings"][buffer_id].zero_()
+ 
+     def get_embedding_tensor(
+         self, target_module: str, lora_type: LoRAType
+diff --git a/python/sglang/srt/lora/triton_ops/__init__.py b/python/sglang/srt/lora/triton_ops/__init__.py
+index 71eb1fea4837..bf7745a284c4 100644
+--- a/python/sglang/srt/lora/triton_ops/__init__.py
++++ b/python/sglang/srt/lora/triton_ops/__init__.py
+@@ -1,3 +1,4 @@
++from .chunked_embedding_lora_a import chunked_embedding_lora_a_forward
+ from .chunked_sgmv_expand import chunked_sgmv_lora_expand_forward
+ from .chunked_sgmv_shrink import chunked_sgmv_lora_shrink_forward
+ from .embedding_lora_a import embedding_lora_a_fwd
+@@ -13,5 +14,6 @@
+     "sgemm_lora_b_fwd",
+     "chunked_sgmv_lora_shrink_forward",
+     "chunked_sgmv_lora_expand_forward",
++    "chunked_embedding_lora_a_forward",
+     "embedding_lora_a_fwd",
+ ]
+diff --git a/python/sglang/srt/lora/triton_ops/chunked_embedding_lora_a.py b/python/sglang/srt/lora/triton_ops/chunked_embedding_lora_a.py
+new file mode 100644
+index 000000000000..bf3cdbe30fde
+--- /dev/null
++++ b/python/sglang/srt/lora/triton_ops/chunked_embedding_lora_a.py
+@@ -0,0 +1,135 @@
++import torch
++import triton
++import triton.language as tl
++
++from sglang.srt.lora.utils import LoRABatchInfo
++
++
++@triton.jit
++def _chunked_embedding_lora_a_kernel(
++    # Pointers to tensors
++    input_ids,
++    weights,
++    output,
++    # Dimensions
++    vocab_size,
++    rank,
++    num_loras,
++    # Strides
++    w_stride_0,  # stride for lora index
++    w_stride_1,  # stride for rank
++    w_stride_2,  # stride for vocab
++    output_stride_0,
++    output_stride_1,
++    # Chunk info
++    seg_indptr,
++    weight_indices,
++    lora_ranks,
++    num_segments,
++    permutation,
++    # Meta-parameters
++    BLOCK_RANK: tl.constexpr,
++):
++    """
++    Embedding lookup for LoRA A weights without support for extra tokens.
++
++    Each program handles one chunk of tokens across rank dimension
++    """
++    chunk_idx = tl.program_id(axis=0)
++    # If chunk id is larger than actual number of chunks, skip
++    if chunk_idx >= num_segments:
++        return
++    # Load LoRA adapter index for this segment, then look up the rank
++    lora_index = tl.load(weight_indices + chunk_idx)
++    rank_val = tl.load(lora_ranks + lora_index)
++    # If rank is 0, skip
++    if rank_val == 0:
++        return
++    # for each token in chunk, load embedding across rank dimension
++    chunk_start = tl.load(seg_indptr + chunk_idx)
++    chunk_end = tl.load(seg_indptr + chunk_idx + 1)
++    for c in range(chunk_start, chunk_end):
++        s_index = tl.load(permutation + c)
++        # Load the token ID
++        token_id = tl.load(input_ids + s_index)
++        # Process in chunks of BLOCK_RANK dimensions
++        num_blocks = tl.cdiv(rank_val, BLOCK_RANK)
++
++        for block_id in range(num_blocks):
++            rank_offset = tl.arange(0, BLOCK_RANK) + block_id * BLOCK_RANK
++            rank_mask = rank_offset < rank_val
++
++            # Use regular LoRA A weights
++            # weights shape: (num_loras, rank, vocab_size)
++            # We need to load weights[lora_index, rank_offset, token_id]
++            weight_ptr = (
++                weights
++                + lora_index * w_stride_0
++                + rank_offset * w_stride_1
++                + token_id * w_stride_2
++            )
++            emb_values = tl.load(weight_ptr, mask=rank_mask, other=0.0)
++
++            # Write to output
++            output_ptr = (
++                output + s_index * output_stride_0 + rank_offset * output_stride_1
++            )
++            tl.store(output_ptr, emb_values, mask=rank_mask)
++
++
++def chunked_embedding_lora_a_forward(
++    input_ids: torch.Tensor,
++    weights: torch.Tensor,
++    batch_info: LoRABatchInfo,
++    vocab_size: int,
++) -> torch.Tensor:
++    """
++    Chunked Forward pass for LoRA A embedding lookup; each program handles one chunk of embedding lookup work
++    belonging to the same adapter
++
++    Args:
++        input_ids: (s,) token IDs
++        weights: (num_loras, rank, vocab_size) LoRA A embedding weights
++        batch_info: LoRABatchInfo containing batch information
++        vocab_size: base vocabulary size
++
++    Returns:
++        output: (s, rank) embedded features
++    """
++    assert input_ids.is_contiguous()
++    assert weights.is_contiguous()
++    assert len(input_ids.shape) == 1
++    assert len(weights.shape) == 3
++
++    S = input_ids.shape[0]
++    num_loras = weights.shape[0]
++    rank = weights.shape[1]
++
++    # Block size for rank dimension
++    BLOCK_RANK = 128
++    num_segments = batch_info.num_segments
++    # 1D Grid: one program per chunk of embedding lookup work
++    grid = (batch_info.bs if batch_info.use_cuda_graph else num_segments,)
++    output = torch.zeros((S, rank), device=input_ids.device, dtype=weights.dtype)
++
++    _chunked_embedding_lora_a_kernel[grid](
++        input_ids,
++        weights,
++        output,
++        vocab_size,
++        rank,
++        num_loras,
++        weights.stride(0),
++        weights.stride(1),
++        weights.stride(2),
++        output.stride(0),
++        output.stride(1),
++        batch_info.seg_indptr,
++        batch_info.weight_indices,
++        batch_info.lora_ranks,
++        batch_info.num_segments,
++        batch_info.permutation,
++        BLOCK_RANK,
++    )
++
++    return output
+diff --git a/python/sglang/srt/lora/triton_ops/chunked_sgmv_expand.py b/python/sglang/srt/lora/triton_ops/chunked_sgmv_expand.py
+index 414f704a7149..a24abbe3743d 100644
+--- a/python/sglang/srt/lora/triton_ops/chunked_sgmv_expand.py
++++ b/python/sglang/srt/lora/triton_ops/chunked_sgmv_expand.py
+@@ -8,7 +8,9 @@
+ from sglang.srt.utils import cached_triton_kernel
+ 
+ 
+-@cached_triton_kernel(lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"]))
++@cached_triton_kernel(
++    lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"], kwargs["OUTPUT_DIM"])
++)
+ @triton.jit(do_not_specialize=["num_segs"])
+ def _chunked_lora_expand_kernel(
+     # Pointers to matrices
+diff --git a/python/sglang/srt/lora/utils.py b/python/sglang/srt/lora/utils.py
+index 7f14f770501a..d121639ca0bc 100644
+--- a/python/sglang/srt/lora/utils.py
++++ b/python/sglang/srt/lora/utils.py
+@@ -1,6 +1,6 @@
+ from dataclasses import dataclass
+ from enum import Enum
+-from typing import Iterable, Optional, Set, Tuple, Union
++from typing import Iterable, List, Optional, Set, Tuple, Union
+ 
+ import torch
+ 
+@@ -40,6 +40,10 @@ class LoRABatchInfo:
+     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
+     permutation: Optional[torch.Tensor]
+ 
++    # Total number of tokens this batch info expects (host-side int).
++    # Used by lm_head LoRA to validate input shape without GPU sync.
++    expected_tokens: Optional[int] = None
++
+ 
+ class LoRAType(Enum):
+     LORA_A = 0
+@@ -193,3 +197,130 @@ def generate_sequence_lengths(
+         else:
+             raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
+     return seg_lens
++
++
++def get_lm_head_pruned_lens(
++    forward_batch: ForwardBatch,
++) -> Optional[List[int]]:
++    """
++    Compute per-sequence pruned lengths for lm_head LoRA.
++
++    Returns a list of pruned lengths (one per sequence) if pruning applies,
++    or None if lm_head pruning is not applicable for this batch.
++
++    Pruning rules:
++    - Extend without logprobs: 1 token per sequence
++    - Extend with logprobs: max(extend_len - logprob_start_len, 1) per sequence
++    - Decode / target_verify / draft_extend_v2: no pruning
++
++    IMPORTANT: This must stay in sync with LogitsProcessor._get_pruned_states()
++    in sglang/srt/layers/logits_processor.py, which determines how many tokens
++    per sequence are passed to lm_head. If the pruning conditions or lengths
++    there change, this function must be updated to match, otherwise the
++    lm_head LoRA will operate on incorrectly shaped inputs.
++    """
++    lm_head_pruning = (
++        forward_batch.forward_mode.is_extend()
++        and not forward_batch.forward_mode.is_target_verify()
++        and not forward_batch.forward_mode.is_draft_extend_v2()
++    )
++
++    if not lm_head_pruning:
++        return None
++
++    if forward_batch.return_logprob:
++        pruned_lens = []
++        for ext_len, start_len in zip(
++            forward_batch.extend_seq_lens_cpu,
++            forward_batch.extend_logprob_start_lens_cpu,
++        ):
++            pruned_lens.append(1 if ext_len == start_len else ext_len - start_len)
++    else:
++        pruned_lens = [1] * forward_batch.batch_size
++
++    return pruned_lens
++
++
++def merge_and_chunk_segments(
++    weight_indices: list[int],
++    pruned_lens: List[int],
++    chunk_size: int,
++) -> Tuple[List[int], List[int]]:
++    """
++    Merge consecutive same-adapter sequences and chunk at chunk_size boundaries.
++
++    Merges consecutive sequences that use the same adapter into single
++    segments, splitting any segment that exceeds chunk_size.
++
++    Args:
++        weight_indices: Per-sequence adapter indices.
++        pruned_lens: Per-sequence pruned token counts.
++        chunk_size: Maximum segment length before splitting.
++
++    Returns:
++        (seg_weight_indices, seg_lens): Merged and chunked segments.
++    """
++    seg_weight_indices: List[int] = []
++    seg_lens: List[int] = []
++    for wi, pl in zip(weight_indices, pruned_lens):
++        if seg_weight_indices and seg_weight_indices[-1] == wi:
++            seg_lens[-1] += pl
++        else:
++            seg_weight_indices.append(wi)
++            seg_lens.append(pl)
++        # Split the last segment if it exceeds chunk_size
++        while seg_lens[-1] > chunk_size:
++            remainder = seg_lens[-1] - chunk_size
++            seg_lens[-1] = chunk_size
++            seg_weight_indices.append(wi)
++            seg_lens.append(remainder)
++
++    return seg_weight_indices, seg_lens
++
++
++def build_lm_head_pass_segments(
++    weight_indices: List[int],
++    pruned_lens: List[int],
++    logprobs_chunk_size: int,
++) -> List[Tuple[List[int], List[int]]]:
++    """
++    Precompute per-pass segment info for lm_head LoRA logprobs processing.
++
++    When LogitsProcessor uses chunked logprobs processing
++    (process_input_logprobs_by_chunk), pruned hidden states are split into
++    fixed-size passes.  Each pass needs its own segmentation
++    (weight_indices, seg_lens) so that lm_head LoRA operates on the
++    correct adapter assignments per pass.
++
++    Args:
++        weight_indices: Per-sequence adapter indices.
++        pruned_lens: Per-sequence pruned token counts.
++        logprobs_chunk_size: Fixed pass size used by LogitsProcessor.
++
++    Returns:
++        List of (seg_weight_indices, seg_lens) tuples, one per pass.
++    """
++    # Expand to per-token weight index
++    token_wi: List[int] = []
++    for wi, pl in zip(weight_indices, pruned_lens):
++        token_wi.extend([wi] * pl)
++    total = len(token_wi)
++    num_passes = (total + logprobs_chunk_size - 1) // logprobs_chunk_size
++
++    result: List[Tuple[List[int], List[int]]] = []
++    for i in range(num_passes):
++        start = i * logprobs_chunk_size
++        end = min((i + 1) * logprobs_chunk_size, total)
++
++        # Run-length encode the pass's adapter indices
++        seg_wi: List[int] = []
++        seg_lens: List[int] = []
++        for t in range(start, end):
++            if seg_wi and seg_wi[-1] == token_wi[t]:
++                seg_lens[-1] += 1
++            else:
++                seg_wi.append(token_wi[t])
++                seg_lens.append(1)
++        result.append((seg_wi, seg_lens))
++
++    return result
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 02ee4c6b7462..c93b1ca82e61 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -5626,17 +5626,6 @@ def check_lora_server_args(self):
+                     ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                     self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
+ 
+-                    # When using the chunked SGMV backend, skip embedding / lm_head layers for now,
+-                    # since it does not support these yet (TODO: implement embedding / lm_head support)
+-                    if self.lora_backend == "csgmv":
+-                        logger.warning(
+-                            "LoRA backend 'csgmv' does not yet support embedding or lm_head layers; "
+-                            "dropping 'embed_tokens' and 'lm_head' from --lora-target-modules=all. "
+-                            "To apply LoRA to these, use --lora-backend triton."
+-                        )
+-                        self.lora_target_modules.discard("embed_tokens")
+-                        self.lora_target_modules.discard("lm_head")
+-
+             # Ensure sufficient information is provided for LoRA initialization.
+             assert self.lora_paths or (
+                 self.max_lora_rank and self.lora_target_modules
+diff --git a/python/sglang/test/lora_utils.py b/python/sglang/test/lora_utils.py
+index ad2b9f42985b..8959b9161a8b 100644
+--- a/python/sglang/test/lora_utils.py
++++ b/python/sglang/test/lora_utils.py
+@@ -201,6 +201,67 @@ def reference_sgmv_shrink(
+     return output
+ 
+ 
++def reference_embedding_lora_a_shrink(
++    input_ids: torch.Tensor,
++    weights: torch.Tensor,
++    weight_indices: torch.Tensor,
++    seq_lengths: torch.Tensor,
++    lora_ranks: torch.Tensor,
++    vocab_size: int,
++) -> torch.Tensor:
++    """
++    Simple sequence-level reference implementation of embedding LoRA A shrink operation.
++
++    Args:
++        input_ids: (total_seq_len,) - Token IDs
++        weights: (num_loras, max_rank, vocab_size) - LoRA A embedding weights
++        weight_indices: LoRA idx for each sequence
++        seq_lengths: Length of each sequence
++        lora_ranks: LoRA rank for each LoRA adapters
++        vocab_size: Base vocabulary size
++
++    Returns:
++        output: (total_seq_len, max_rank) - Embedded features
++    """
++    if weights.numel() == 0:
++        total_tokens = input_ids.shape[0]
++        return torch.zeros(total_tokens, 0, dtype=weights.dtype, device=weights.device)
++
++    total_tokens = input_ids.shape[0]
++    _, max_rank, _ = weights.shape
++
++    output = torch.zeros(
++        total_tokens, max_rank, dtype=weights.dtype, device=weights.device
++    )
++
++    token_offset = 0
++    for lora_idx, seq_len, rank in zip(
++        weight_indices,
++        seq_lengths,
++        lora_ranks[weight_indices],
++    ):
++        if seq_len == 0:
++            continue
++
++        if rank > 0:
++            # Get token IDs for this sequence
++            seq_input_ids = input_ids[token_offset : token_offset + seq_len]
++
++            # Clamp token IDs to vocab size
++            clamped_ids = torch.clamp(seq_input_ids, max=vocab_size - 1)
++
++            # Lookup embeddings: weights[lora_idx, :rank, token_ids] -> (seq_len, rank)
++            # weights shape: (num_loras, max_rank, vocab_size)
++            lora_weights = weights[lora_idx, :rank, :]  # (rank, vocab_size)
++            embeddings = lora_weights[:, clamped_ids].t()  # (seq_len, rank)
++
++            output[token_offset : token_offset + seq_len, :rank] = embeddings
++
++        token_offset += seq_len
++
++    return output
++
++
+ def reference_sgmv_expand(
+     x: torch.Tensor,
+     weights: torch.Tensor,
+diff --git a/test/manual/lora/test_chunked_sgmv_backend.py b/test/registered/lora/test_chunked_sgmv_backend.py
+similarity index 78%
+rename from test/manual/lora/test_chunked_sgmv_backend.py
+rename to test/registered/lora/test_chunked_sgmv_backend.py
+index 2b4a93a28148..4073317cd364 100644
+--- a/test/manual/lora/test_chunked_sgmv_backend.py
++++ b/test/registered/lora/test_chunked_sgmv_backend.py
+@@ -5,18 +5,28 @@
+ 
+ import torch
+ 
++from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+ from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
+ from sglang.srt.lora.triton_ops import (
++    chunked_embedding_lora_a_forward,
+     chunked_sgmv_lora_expand_forward,
+     chunked_sgmv_lora_shrink_forward,
+ )
+ from sglang.srt.lora.triton_ops.chunked_sgmv_expand import _chunked_lora_expand_kernel
+ from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
+-from sglang.srt.lora.utils import LoRABatchInfo
+-from sglang.test.lora_utils import reference_sgmv_expand, reference_sgmv_shrink
++from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_pruned_lens
++from sglang.srt.model_executor.forward_batch_info import ForwardMode
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.lora_utils import (
++    reference_embedding_lora_a_shrink,
++    reference_sgmv_expand,
++    reference_sgmv_shrink,
++)
+ 
+ CHUNK_SIZE = 16
+ 
++register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
++
+ 
+ def reset_kernel_cache():
+     _chunked_lora_shrink_kernel._clear_cache()
+@@ -100,6 +110,7 @@ def setUp(self):
+         self.dtype = torch.float16
+         self.input_dim = 2560  # Hidden dimension
+         self.max_seq_len = 1024
++        self.vocab_size = 32000  # Vocabulary size for embedding tests
+ 
+         # LoRA configurations: name -> (rank, output_q, output_k, output_v)
+         self.lora_configs = {
+@@ -285,6 +296,42 @@ def stack_lora_weights(
+ 
+         return stacked
+ 
++    def create_embedding_lora_a_weights(self, lora_ranks: torch.Tensor) -> torch.Tensor:
++        """Create LoRA A weights for embedding lookup.
++
++        Args:
++            lora_ranks: Tensor of ranks for each LoRA adapter
++
++        Returns:
++            Tensor of shape (num_loras, max_rank, vocab_size)
++        """
++        lora_ranks_cpu = lora_ranks.cpu().numpy()
++        num_loras = len(lora_ranks_cpu)
++        max_rank = int(lora_ranks_cpu.max()) if num_loras > 0 else 0
++
++        if max_rank == 0:
++            return torch.empty(
++                num_loras, 0, self.vocab_size, dtype=self.dtype, device=self.device
++            )
++
++        weights = torch.zeros(
++            num_loras, max_rank, self.vocab_size, dtype=self.dtype, device=self.device
++        )
++
++        for i, rank in enumerate(lora_ranks_cpu):
++            if rank > 0:
++                weights[i, :rank, :] = torch.randn(
++                    rank, self.vocab_size, dtype=self.dtype, device=self.device
++                )
++
++        return weights
++
++    def create_test_input_ids(self, total_tokens: int) -> torch.Tensor:
++        """Create random token IDs for embedding test."""
++        return torch.randint(
++            0, self.vocab_size, (total_tokens,), dtype=torch.int64, device=self.device
++        )
++
+     def create_test_batch(
+         self,
+         batch_composition: BatchComposition,
+@@ -461,6 +508,36 @@ def test_shrink_basic(self):
+                     chunked_shrink, reference_shrink, rtol=self.RTOL, atol=self.ATOL
+                 )
+ 
++                # Test chunked embedding LoRA A forward
++                # Create embedding-specific LoRA A weights with shape (num_loras, rank, vocab_size)
++                embedding_lora_a = self.create_embedding_lora_a_weights(
++                    batch_info.lora_ranks
++                )
++
++                # Create input_ids (token indices) instead of hidden states
++                total_tokens = x.shape[0]
++                input_ids = self.create_test_input_ids(total_tokens)
++
++                chunked_shrink_embeddings = chunked_embedding_lora_a_forward(
++                    input_ids, embedding_lora_a, batch_info, self.vocab_size
++                )
++
++                reference_shrink_embeddings = reference_embedding_lora_a_shrink(
++                    input_ids,
++                    embedding_lora_a,
++                    lora_assignments_tensor,
++                    seq_lengths_tensor,
++                    lora_ranks_tensor,
++                    self.vocab_size,
++                )
++                torch.testing.assert_close(
++                    chunked_shrink_embeddings,
++                    reference_shrink_embeddings,
++                    rtol=self.RTOL,
++                    atol=self.ATOL,
++                    msg=f"Shrink test embedding loRA A operation failed for batch_size={batch_size}",
++                )
++
+     def test_expand_basic(self):
+         """Test basic expand operation against PyTorch reference"""
+         for batch_size in [1, 2, 16, 64]:
+@@ -644,5 +721,104 @@ def test_decode_skewed_lora_batch(self):
+                 )
+ 
+ 
++class TestLmHeadPruningConsistency(unittest.TestCase):
++    """Verify get_lm_head_pruned_lens (LoRA) stays consistent with
++    LogitsProcessor._get_pruned_states (logits_processor).
++
++    If this test fails, it likely means one side was changed without
++    updating the other. See cross-references in both functions.
++    """
++
++    def _make_mock_forward_batch(
++        self,
++        forward_mode,
++        extend_seq_lens_cpu,
++        return_logprob=False,
++        logprob_start_lens_cpu=None,
++    ):
++        class MockForwardBatch:
++            pass
++
++        batch = MockForwardBatch()
++        batch.forward_mode = forward_mode
++        batch.batch_size = len(extend_seq_lens_cpu)
++        batch.return_logprob = return_logprob
++        batch.extend_seq_lens_cpu = extend_seq_lens_cpu
++        batch.extend_logprob_start_lens_cpu = logprob_start_lens_cpu
++        return batch
++
++    def _count_pruned_states_tokens(
++        self,
++        forward_mode,
++        extend_seq_lens_cpu,
++        return_logprob=False,
++        logprob_start_lens_cpu=None,
++    ):
++        """Call _get_pruned_states and return the number of output tokens."""
++        total_tokens = sum(extend_seq_lens_cpu)
++        hidden_states = torch.zeros(total_tokens, 4)
++
++        logits_meta = LogitsMetadata(
++            forward_mode=forward_mode,
++            extend_return_logprob=return_logprob,
++            extend_seq_lens=torch.tensor(extend_seq_lens_cpu, dtype=torch.int64),
++            extend_seq_lens_cpu=extend_seq_lens_cpu,
++            extend_logprob_start_lens_cpu=logprob_start_lens_cpu,
++        )
++
++        # _get_pruned_states does not use self, so pass None
++        result = LogitsProcessor._get_pruned_states(
++            None, hidden_states, None, None, logits_meta
++        )
++        pruned_states = result[0]
++        return pruned_states.shape[0]
++
++    def _assert_consistency(
++        self,
++        forward_mode,
++        extend_seq_lens_cpu,
++        return_logprob=False,
++        logprob_start_lens_cpu=None,
++    ):
++        mock_batch = self._make_mock_forward_batch(
++            forward_mode,
++            extend_seq_lens_cpu,
++            return_logprob,
++            logprob_start_lens_cpu,
++        )
++        pruned_lens = get_lm_head_pruned_lens(mock_batch)
++
++        actual_count = self._count_pruned_states_tokens(
++            forward_mode,
++            extend_seq_lens_cpu,
++            return_logprob,
++            logprob_start_lens_cpu,
++        )
++
++        if pruned_lens is None:
++            expected_count = sum(extend_seq_lens_cpu)
++        else:
++            expected_count = sum(pruned_lens)
++
++        self.assertEqual(
++            expected_count,
++            actual_count,
++            f"get_lm_head_pruned_lens expects {expected_count} tokens, "
++            f"but _get_pruned_states produces {actual_count}. "
++            f"These functions must stay in sync — see their cross-reference comments.",
++        )
++
++    def test_extend_no_logprob(self):
++        self._assert_consistency(ForwardMode.EXTEND, [4, 5, 6])
++
++    def test_extend_with_logprob(self):
++        self._assert_consistency(
++            ForwardMode.EXTEND,
++            [4, 5, 6],
++            return_logprob=True,
++            logprob_start_lens_cpu=[0, 5, 3],
++        )
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test/registered/lora/test_lora_hf_sgl_logprob_diff.py b/test/registered/lora/test_lora_hf_sgl_logprob_diff.py
+index ccf970752a75..73caf15081b2 100644
+--- a/test/registered/lora/test_lora_hf_sgl_logprob_diff.py
++++ b/test/registered/lora/test_lora_hf_sgl_logprob_diff.py
+@@ -28,6 +28,7 @@
+ """
+ 
+ import multiprocessing as mp
++import os
+ import unittest
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+@@ -47,10 +48,13 @@
+     suite="stage-b-test-small-1-gpu-amd",
+ )
+ # Test configuration constants
+-LORA_BACKEND = "triton"
++BASE_MODEL = "meta-llama/Llama-2-7b-hf"
++LORA_PATHS = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
++LORA_BACKEND = "csgmv"
+ DISABLE_CUDA_GRAPH = False
+ LORA_TARGET_MODULES = None
+ LOGPROB_THRESHOLD = 1e-01
++MAX_NEW_TOKENS = 32
+ 
+ # Default test prompts
+ DEFAULT_TEST_PROMPTS = [
+@@ -442,7 +446,7 @@ def _run_comparison_test(
+         model_path: str,
+         lora_paths: List[str],
+         prompts: List[str],
+-        max_new_tokens: int = 32,
++        max_new_tokens: int = MAX_NEW_TOKENS,
+         torch_dtype: torch.dtype = torch.float16,
+         lora_backend: str = LORA_BACKEND,
+         port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
+@@ -506,32 +510,51 @@ def test_lora_logprob_comparison_basic(self):
+         """
+         Basic test comparing HF and SGLang LoRA logprobs with small model.
+         """
+-        model_path = "meta-llama/Llama-2-7b-hf"
+-        lora_paths = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
+         prompts = DEFAULT_TEST_PROMPTS[:2]  # Use fewer prompts for faster testing
+ 
+         self._run_comparison_test(
+-            model_path=model_path,
+-            lora_paths=lora_paths,
++            model_path=BASE_MODEL,
++            lora_paths=LORA_PATHS,
+             prompts=prompts,
+-            max_new_tokens=32,
+         )
+ 
+     def test_lora_logprob_comparison_full(self):
+         """
+         Full test comparing HF and SGLang LoRA logprobs with all prompts.
+         """
+-        model_path = "meta-llama/Llama-2-7b-hf"
+-        lora_paths = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
+-        prompts = DEFAULT_TEST_PROMPTS
+-
+         self._run_comparison_test(
+-            model_path=model_path,
+-            lora_paths=lora_paths,
+-            prompts=prompts,
+-            max_new_tokens=32,
++            model_path=BASE_MODEL,
++            lora_paths=LORA_PATHS,
++            prompts=DEFAULT_TEST_PROMPTS,
+         )
+ 
++    def test_lora_logprob_comparison_chunked(self):
++        """
++        Test with logprobs chunking enabled and a small chunk size so that
++        even short prompts trigger the multi-pass lm_head LoRA path.
++        """
++        saved = {}
++        env_overrides = {
++            "SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK": "true",
++            "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE": "4",
++        }
++        for key, val in env_overrides.items():
++            saved[key] = os.environ.get(key)
++            os.environ[key] = val
++
++        try:
++            self._run_comparison_test(
++                model_path=BASE_MODEL,
++                lora_paths=LORA_PATHS,
++                prompts=DEFAULT_TEST_PROMPTS,
++            )
++        finally:
++            for key, orig in saved.items():
++                if orig is None:
++                    os.environ.pop(key, None)
++                else:
++                    os.environ[key] = orig
++
+ 
+ if __name__ == "__main__":
+     try:
