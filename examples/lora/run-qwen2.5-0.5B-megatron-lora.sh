@@ -97,12 +97,10 @@ OPTIMIZER_ARGS=(
    --adam-beta2 0.98
 )
 
-WANDB_ARGS=(
-   --use-wandb
-   --wandb-host https://wandb.ai/
-   --wandb-team slime-lora
-   --wandb-project slime-lora-megatron
-   --wandb-group qwen2.5-0.5B-gsm8k-test
+MLFLOW_ARGS=(
+   --use-mlflow
+   --mlflow-experiment-name slime-lora-megatron
+   --mlflow-run-name qwen2.5-0.5B-gsm8k-test
 )
 
 
@@ -153,7 +151,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${LORA_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
-   ${WANDB_ARGS[@]} \
+   ${MLFLOW_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
