@@ -14,10 +14,10 @@ pkill -9 python
 set -ex
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/../../scripts/models/qwen3.5-35B-A3B.sh"
+source "${SCRIPT_DIR}/../../scripts/models/qwen3-30B-A3B.sh"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/Qwen3.5-35B-A3B/
+   --hf-checkpoint /root/Qwen3-30B-A3B/
    --megatron-to-hf-mode bridge
 )
 
@@ -91,7 +91,7 @@ OPTIMIZER_ARGS=(
 MLFLOW_ARGS=(
    --use-mlflow
    --mlflow-experiment-name slime-lora-megatron
-   --mlflow-run-name qwen3.5-35B-A3B-gsm8k-lora
+   --mlflow-run-name qwen3-30B-A3B-gsm8k-lora
 )
 
 SGLANG_ARGS=(
