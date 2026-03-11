@@ -77,9 +77,6 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   --use-dynamic-batch-size
-   --max-tokens-per-gpu 9216
-
    # Packing is not supported for GDN currently
    --qkv-format bshd
    --micro-batch-size 1
