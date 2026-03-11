@@ -56,7 +56,7 @@ def test_mlflow():
     """Test MLflow import and basic functionality."""
     print("Testing MLflow...")
     import mlflow
-    from slime.utils.tracking.mlflow_utils import setup_mlflow
+    from slime.utils.tracking.mlflow_utils import init_mlflow, log_metrics
     print(f"  MLflow version: {mlflow.__version__}")
     print("  OK: MLflow")
 
