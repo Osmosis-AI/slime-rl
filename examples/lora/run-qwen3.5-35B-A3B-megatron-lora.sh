@@ -114,11 +114,11 @@ SGLANG_ARGS=(
    --sglang-ep-size 8
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 
-   # MTP speculative decoding
-   --sglang-speculative-algorithm EAGLE
-   --sglang-speculative-num-steps 2
-   --sglang-speculative-eagle-topk 1
-   --sglang-speculative-num-draft-tokens 3
+   # MTP speculative decoding disabled — SGLang LoRA only supports NGRAM
+   # --sglang-speculative-algorithm EAGLE
+   # --sglang-speculative-num-steps 2
+   # --sglang-speculative-eagle-topk 1
+   # --sglang-speculative-num-draft-tokens 3
 
    --sglang-max-running-requests 512
    --offload-train
