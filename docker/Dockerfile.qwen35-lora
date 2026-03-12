@@ -129,6 +129,10 @@ RUN git clone -b ${SLIME_BRANCH} https://github.com/${SLIME_REPO} /root/slime &&
     cd /root/slime && \
     pip install -e . --no-deps
 
+# miles → slime import redirect: Megatron-LM (miles-main fork) has hardcoded
+# `from miles.xxx import yyy` — this symlink makes them resolve to slime.xxx
+RUN ln -s /root/slime/slime $(python3 -c "import site; print(site.getsitepackages()[0])")/miles
+
 RUN cd /root/slime/slime/backends/megatron_utils/kernels/int4_qat && \
     pip install . --no-build-isolation
 
