@@ -71,6 +71,9 @@ RUN if [ "$ENABLE_CUDA_13" = "1" ]; then \
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt
 
+# Qwen3.5 requires native config support (qwen3_5_moe model type)
+RUN pip install "transformers>=5.2.0"
+
 # MLflow for experiment tracking (--ignore-installed blinker for debian conflict)
 RUN pip install mlflow --ignore-installed blinker
 
