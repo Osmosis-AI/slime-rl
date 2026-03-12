@@ -110,6 +110,14 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
   rm sglang.patch; \
 fi
 
+# SGLang LoRA composite config fix: pass hf_text_config (not hf_config) to LoRAManager
+# so num_hidden_layers/hidden_size/vocab_size resolve correctly for composite models
+# like Qwen3.5 MoE (where these attrs live inside text_config, not at top level).
+# Upstreamable to sgl-project/sglang.
+RUN cd /sgl-workspace/sglang && \
+    sed -i 's/base_hf_config=self\.model_config\.hf_config,/base_hf_config=self.model_config.hf_text_config,/' \
+    python/sglang/srt/model_executor/model_runner.py
+
 # SGLang LoRA patches for MoE models (optional, separate PRs with overlapping files).
 # These are NOT applied by default — SGLang v0.5.9 already has base LoRA support.
 # To enable MoE LoRA patches, combine them into a single merged patch first:
