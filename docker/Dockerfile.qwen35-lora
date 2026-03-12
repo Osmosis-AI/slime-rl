@@ -56,9 +56,9 @@ RUN git clone https://github.com/NVIDIA/Megatron-LM.git --recursive && \
 
 RUN pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@1bc80bb0d63db3b6af34b6c5e6139cf470fe1fcc --no-cache-dir --force-reinstall
 
-# Megatron-Bridge: Qwen3.5 support requires coding-famer fork
-# Standard fzyzcjy/Megatron-Bridge@dev_rl does NOT support Qwen3.5 models
-RUN pip install git+https://github.com/coding-famer/Megatron-Bridge-slime.git@qwen35 --no-build-isolation
+# Megatron-Bridge: yushengsu-thu fork has LoRA export_adapter_weights support
+# Required for LoRA weight sync to SGLang
+RUN pip install git+https://github.com/yushengsu-thu/Megatron-Bridge.git@merged-megatron-0.16.0rc0-miles --no-deps --no-build-isolation
 
 RUN pip install nvidia-modelopt[torch]>=0.42.0 --no-build-isolation
 
