@@ -67,22 +67,40 @@ def _get_model_config_from_wrapped(model):
 
 
 _qwen35_bridges_registered = False
+_qwen35_native_bridges = False
 
 
 def _register_qwen35_bridges():
     """Register Qwen3.5 model architectures with megatron-bridge.
 
-    Standard megatron-bridge does not know about Qwen3.5. The coding-famer
-    fork (``coding-famer/Megatron-Bridge-slime@qwen35``) adds native support,
-    but if that fork is not installed we fall back to aliasing Qwen3.5 to the
-    closest existing Qwen3 VL bridges so ``AutoBridge.from_hf_pretrained``
-    can at least resolve the architecture.
+    Prefers native Qwen3.5 bridges (from the Osmosis-AI/Megatron-Bridge
+    ``merged-qwen35-lora`` fork) which handle config translation correctly.
+    Importing the native module triggers ``@register_bridge`` decorators.
+
+    Falls back to aliasing Qwen3.5 to Qwen3 VL bridges if the native module
+    is not available, though this path requires ``_patch_qwen35_config`` and
+    may break for models with mismatched kv_channels (128 vs 256).
     """
-    global _qwen35_bridges_registered
+    global _qwen35_bridges_registered, _qwen35_native_bridges
     if _qwen35_bridges_registered:
         return
     _qwen35_bridges_registered = True
 
+    # Try native Qwen3.5 bridges first — importing triggers decorator registration.
+    try:
+        import megatron.bridge.models.qwen_vl.qwen35_vl_bridge as _  # noqa: F401
+        _qwen35_native_bridges = True
+        logger.info("Using native Qwen3.5 bridges (Qwen35VLMoEBridge / Qwen35VLBridge)")
+        return
+    except (ImportError, ModuleNotFoundError):
+        logger.info(
+            "Native Qwen3.5 bridge module not found, falling back to Qwen3 VL aliases. "
+            "Install Osmosis-AI/Megatron-Bridge@merged-qwen35-lora for full Qwen3.5 support."
+        )
+
+    # Fallback: alias Qwen3.5 architectures to Qwen3 VL bridges.
+    # This works for models where kv_channels match (e.g. both 128) but will
+    # fail for Qwen3.5-35B-A3B (kv_channels=256) vs Qwen3 VL (kv_channels=128).
     try:
         from megatron.bridge.models.conversion.model_bridge import (
             get_model_bridge,
@@ -93,7 +111,6 @@ def _register_qwen35_bridges():
 
     registry = getattr(get_model_bridge, "_exact_types", {})
 
-    # Dense VLM (e.g. Qwen3.5-4B)
     _try_register(
         registry,
         register_bridge_implementation,
@@ -104,7 +121,6 @@ def _register_qwen35_bridges():
         target_class_name="Qwen3VLModel",
     )
 
-    # MoE VLM (e.g. Qwen3.5-35B-A3B)
     _try_register(
         registry,
         register_bridge_implementation,
@@ -120,7 +136,6 @@ def _try_register(registry, register_fn, *, arch_name, bridge_module, bridge_cla
     """Register a single architecture if not already present."""
     import importlib
 
-    # Check both string and class keys
     already = arch_name in registry
     if not already:
         try:
@@ -143,7 +158,7 @@ def _try_register(registry, register_fn, *, arch_name, bridge_module, bridge_cla
     except (ImportError, AttributeError) as exc:
         logger.warning(
             "Cannot register %s: %s bridge not available (%s). "
-            "Install the coding-famer Megatron-Bridge fork for Qwen3.5 support.",
+            "Install Osmosis-AI/Megatron-Bridge@merged-qwen35-lora for Qwen3.5 support.",
             arch_name, bridge_class_name, exc,
         )
         return
@@ -153,12 +168,17 @@ def _try_register(registry, register_fn, *, arch_name, bridge_module, bridge_cla
 
 
 def _patch_qwen35_config(bridge):
-    """Patch Qwen3.5 text_config for compatibility with Qwen3 VL bridges.
+    """Patch Qwen3.5 text_config for compatibility with Qwen3 VL bridge aliases.
+
+    Only needed when using the fallback aliased bridges (Qwen3 VL).
+    Native Qwen3.5 bridges handle config translation correctly and skip this.
 
     Qwen3.5 configs differ from Qwen3 VL in two ways:
     1. ``rope_theta`` is nested inside ``rope_parameters`` instead of top-level.
     2. MoE variants lack ``intermediate_size`` (the bridge reads it for ffn_hidden_size).
     """
+    if _qwen35_native_bridges:
+        return
     hf_config = getattr(bridge, "hf_pretrained", None)
     if hf_config is None:
         return
@@ -199,14 +219,14 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
 
     hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
 
-    # Qwen3.5 models are not natively registered in megatron-bridge.
-    # Register them with existing Qwen3 VL bridges before calling AutoBridge.
+    # Register Qwen3.5 bridges if not already present.  Prefers native bridges
+    # (Osmosis-AI fork) which handle config correctly; falls back to Qwen3 VL aliases.
     _register_qwen35_bridges()
 
     bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
 
-    # Qwen3.5 stores rope_theta inside rope_parameters, but the Qwen3 VL bridge
-    # reads it as a top-level attribute on text_config.  Patch it through.
+    # Only patches config when using the fallback Qwen3 VL aliases; no-op with
+    # native Qwen3.5 bridges that handle rope_theta/intermediate_size natively.
     _patch_qwen35_config(bridge)
 
     provider = bridge.to_megatron_provider(load_weights=False)
