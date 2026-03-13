@@ -567,22 +567,6 @@ class RolloutManager:
                 except Exception as e:
                     logger.warning(f"Failed to pause router health checks at {url}: {e}")
 
-    def _router_resume_health_checks(self) -> None:
-        """Notify slime routers to resume health checks after memory onload."""
-        if not getattr(self.args, "use_slime_router", False):
-            return
-        for srv in self.servers.values():
-            if srv.router_ip and srv.router_port:
-                url = f"http://{srv.router_ip}:{srv.router_port}/resume_health_checks"
-                try:
-                    resp = _requests.post(url, json={}, timeout=5)
-                    logger.info(f"Router resume_health_checks {url} -> {resp.status_code}")
-                    data = resp.json()
-                    if data.get("revived_workers"):
-                        logger.info(f"Router revived workers after offload: {data['revived_workers']}")
-                except Exception as e:
-                    logger.warning(f"Failed to resume router health checks at {url}: {e}")
-
     def check_weights(self, action: str):
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
 
