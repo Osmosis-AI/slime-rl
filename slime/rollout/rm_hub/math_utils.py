@@ -478,6 +478,10 @@ def grade_answer_mathd(given_answer: str, ground_truth: str) -> bool:
 def extract_answer(passage: str) -> str:
     if "\\boxed" in passage:
         return extract_boxed_answer(passage)
+    # Fallback: extract last bold markdown answer like **48** or **\frac{1}{2}**
+    bold_matches = re.findall(r"\*\*([^*]+)\*\*", passage)
+    if bold_matches:
+        return bold_matches[-1].strip()
     return None
 
 
