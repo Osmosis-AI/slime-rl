@@ -25,8 +25,10 @@ from megatron.training.training import get_model
 from slime.utils import logging_utils
 from slime.utils.memory_utils import clear_memory
 
-from .checkpoint import load_checkpoint, save_checkpoint
+from .bridge_lora_helpers import _ensure_model_list, _setup_lora_model_via_bridge
+from .checkpoint import load_checkpoint, save_checkpoint, save_checkpoint_with_lora
 from .data import DataIterator, get_batch
+from .lora_utils import is_lora_enabled, is_lora_model, save_lora_checkpoint
 from .loss import loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
@@ -105,9 +107,12 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
-    model = get_model(
-        wrap_model_provider_with_freeze(get_model_provider_func(args, role), args), ModelType.encoder_or_decoder
-    )
+    if is_lora_enabled(args) and role == "actor" and args.megatron_to_hf_mode == "bridge":
+        model = _setup_lora_model_via_bridge(args)
+    else:
+        model = get_model(
+            wrap_model_provider_with_freeze(get_model_provider_func(args, role), args), ModelType.encoder_or_decoder
+        )
 
     # Optimizer
     kwargs = {}
@@ -698,16 +703,20 @@ def save(
     args = get_args()
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
-    save_checkpoint(
-        iteration,
-        model,
-        optimizer,
-        opt_param_scheduler,
-        num_floating_point_operations_so_far=0,
-        checkpointing_context=None,
-        train_data_iterator=None,
-        preprocess_common_state_dict_fn=None,
-    )
+
+    if is_lora_model(model):
+        save_checkpoint_with_lora(iteration, model, optimizer, opt_param_scheduler)
+    else:
+        save_checkpoint(
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far=0,
+            checkpointing_context=None,
+            train_data_iterator=None,
+            preprocess_common_state_dict_fn=None,
+        )
 
     if args.save and torch.distributed.get_rank() == 0:
         from slime.utils import logging_utils
@@ -743,16 +752,25 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
         path.mkdir(parents=True, exist_ok=True)
 
         with patch_megatron_model(model):
-            bridge.save_hf_pretrained(
-                model,
-                path=path,
-            )
+            bridge.save_hf_pretrained(model, path=path)
 
         if should_log:
-            logger.info(f"Successfully saved HuggingFace model to {path}")
+            logger.info(f"Successfully saved merged HuggingFace model to {path}")
     except Exception as e:
         if should_log:
             logger.error(f"Failed to save HuggingFace format: {e}")
+
+    if is_lora_model(model):
+        try:
+            adapter_path = Path(args.save_hf.format(rollout_id=rollout_id)) / "adapter"
+            if should_log:
+                logger.info(f"Saving LoRA adapter (HF PEFT format) to {adapter_path}")
+            save_lora_checkpoint(model, args, str(adapter_path))
+            if should_log:
+                logger.info(f"Successfully saved LoRA adapter to {adapter_path}")
+        except Exception as e:
+            if should_log:
+                logger.error(f"Failed to save LoRA adapter: {e}")
 
 
 def initialize_model_and_optimizer(

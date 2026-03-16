@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import requests as _requests
+
 import numpy as np
 import ray
 import torch
@@ -464,6 +466,10 @@ class RolloutManager:
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        # Pause health checks before returning to training loop — workers may become
+        # temporarily unresponsive during training (GPU memory pressure) or weight updates.
+        self.health_monitoring_pause()
+        self._router_pause_health_checks()
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:
@@ -479,6 +485,9 @@ class RolloutManager:
         self.health_monitoring_resume()
 
         result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
+        # Pause health checks before returning to training loop
+        self.health_monitoring_pause()
+        self._router_pause_health_checks()
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
@@ -491,6 +500,7 @@ class RolloutManager:
 
     def offload(self):
         self.health_monitoring_pause()
+        self._router_pause_health_checks()
         for srv in self.servers.values():
             srv.offload()
 
@@ -513,6 +523,7 @@ class RolloutManager:
         updates from training).
         """
         self.health_monitoring_pause()
+        self._router_pause_health_checks()
         srv = self._get_updatable_server()
         if self.rollout_id == -1 or srv is None:
             engines = srv.engines if srv else []
@@ -542,6 +553,19 @@ class RolloutManager:
     def health_monitoring_resume(self) -> None:
         for monitor in self._health_monitors:
             monitor.resume()
+
+    def _router_pause_health_checks(self) -> None:
+        """Notify slime routers to pause health checks during memory offload."""
+        if not getattr(self.args, "use_slime_router", False):
+            return
+        for srv in self.servers.values():
+            if srv.router_ip and srv.router_port:
+                url = f"http://{srv.router_ip}:{srv.router_port}/pause_health_checks"
+                try:
+                    resp = _requests.post(url, json={}, timeout=5)
+                    logger.info(f"Router pause_health_checks {url} -> {resp.status_code}")
+                except Exception as e:
+                    logger.warning(f"Failed to pause router health checks at {url}: {e}")
 
     def check_weights(self, action: str):
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])

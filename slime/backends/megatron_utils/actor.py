@@ -28,6 +28,7 @@ from slime.utils.types import RolloutBatch
 from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
+from .lora_utils import is_lora_enabled
 from .cp_utils import slice_log_prob_with_cp, slice_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
 from .initialize import init, is_megatron_main_rank
@@ -138,6 +139,7 @@ class MegatronTrainRayActor(TrainRayActor):
             weights_getter=lambda: self.weights_backuper.get("actor"),
             model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
             quantization_config=getattr(self.hf_config, "quantization_config", None),
+            is_lora=is_lora_enabled(args),
         )
 
         # empty cache after initialization
@@ -559,12 +561,14 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
+        if self.args.offload_train and is_lora_enabled(self.args):
+            torch_memory_saver.resume()
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")
 
-            if self.args.ci_test and len(rollout_engines) > 0:
+            if self.args.ci_test and len(rollout_engines) > 0 and not is_lora_enabled(self.args):
                 engine = random.choice(rollout_engines)
                 engine_version = ray.get(engine.get_weight_version.remote())
                 if str(engine_version) != str(self.weight_updater.weight_version):
@@ -584,6 +588,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("old_actor")
 
         if self.args.offload_train:
+            if is_lora_enabled(self.args):
+                torch_memory_saver.pause()
             destroy_process_groups()
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:

@@ -1,0 +1,147 @@
+ARG SGLANG_IMAGE_TAG=v0.5.9
+FROM slimerl/sglang:${SGLANG_IMAGE_TAG} AS sglang
+
+# ======================================== Arguments =============================================
+
+ARG PATCH_VERSION=latest
+ARG MEGATRON_REPO=Osmosis-AI/Megatron-LM
+ARG MEGATRON_BRANCH=miles-main
+
+ARG ENABLE_CUDA_13=0
+
+# ======================================== Setup =============================================
+
+WORKDIR /root/
+
+# ======================================== Apt dependencies =============================================
+
+RUN apt update
+RUN apt install -y nvtop rsync dnsutils
+
+# ====================================== Python dependencies ============================================
+
+# The compilation is slow, thus should be put at top
+# TransformerEngines does not support too high FA2
+RUN MAX_JOBS=16 pip -v install flash-attn==2.8.3 --no-build-isolation
+
+# The compilation is slow, thus should be put at top
+RUN git clone https://github.com/Dao-AILab/flash-attention.git && \
+    cd flash-attention/ && git checkout fbf24f67cf7f6442c5cfb2c1057f4bfc57e72d89 && git submodule update --init && cd hopper/ && \
+    MAX_JOBS=16 python setup.py install && \
+    export python_path=`python -c "import site; print(site.getsitepackages()[0])"` && \
+    mkdir -p $python_path/flash_attn_3 && \
+    cp flash_attn_interface.py $python_path/flash_attn_3/flash_attn_interface.py && \
+    rm -rf flash-attention/
+
+RUN pip install git+https://github.com/ISEEKYAN/mbridge.git@ed7d432112f29cd695f6620972bb375602d91407 --no-deps
+
+RUN pip install flash-linear-attention==0.4.1
+RUN pip install tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
+
+# TE does not have wheel on cuda 13 yet, thus need to install from source
+RUN if [ "${ENABLE_CUDA_13}" = "1" ]; then \
+      pip install nvidia-mathdx==26.6.0 && \
+      pip -v install --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.12; \
+    else \
+      pip -v install --no-build-isolation "transformer_engine[pytorch]==2.12.0"; \
+    fi
+
+RUN NVCC_APPEND_FLAGS="--threads 4" \
+  pip -v install --disable-pip-version-check --no-cache-dir \
+  --no-build-isolation \
+  --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" git+https://github.com/NVIDIA/apex.git@f199212da7234bf9be2244cad5b9bfa2f5fe2675
+
+RUN git clone -b ${MEGATRON_BRANCH} https://github.com/${MEGATRON_REPO}.git Megatron-LM --recursive && \
+    cd Megatron-LM && \
+    pip install -e .
+
+RUN pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@1bc80bb0d63db3b6af34b6c5e6139cf470fe1fcc --no-cache-dir --force-reinstall
+
+# Megatron-Bridge: Osmosis-AI merged fork with native Qwen3.5 bridges + LoRA export_adapter_weights
+# Based on coding-famer/qwen35 (Qwen3.5 bridge) + export_adapter_weights for LoRA weight sync
+RUN pip install git+https://github.com/Osmosis-AI/Megatron-Bridge.git@merged-qwen35-lora --no-deps --no-build-isolation
+
+RUN pip install nvidia-modelopt[torch]>=0.42.0 --no-build-isolation
+
+# This patch from masahi will be included in later Triton releases
+RUN if [ "$ENABLE_CUDA_13" = "1" ]; then \
+    (cd /root && git clone -b feat/v350_plus_8045 https://github.com/fzyzcjy/triton.git && cd triton && pip install -r python/requirements.txt && pip install --verbose -e .); \
+  fi
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install -r /tmp/requirements.txt
+
+# Qwen3.5 requires native config support (qwen3_5_moe model type)
+RUN pip install "transformers>=5.2.0"
+
+# MLflow for experiment tracking (--ignore-installed blinker for debian conflict)
+RUN pip install mlflow --ignore-installed blinker
+
+# Temporarily install another sgl-kernel version for GB300 without rebuilding the whole image
+RUN if [ "$ENABLE_CUDA_13" = "1" ]; then \
+    SGL_KERNEL_VERSION=0.3.17.post2 && \
+    python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps; \
+  fi
+
+# CuDNN fix (https://github.com/pytorch/pytorch/issues/168167)
+# MUST be installed LAST — megatron-bridge pulls in torch which downgrades to 9.10
+RUN pip install nvidia-cudnn-cu12==9.16.0.29
+
+# reinstall numpy 1.x for megatron
+RUN pip install "numpy<2"
+
+RUN rm -rf /root/.cache/pip /root/flash-attention
+
+# ====================================== Patches ============================================
+
+# Megatron-LM patch removed: Osmosis-AI/Megatron-LM@miles-main already includes all fixes.
+
+# TODO temporarily skip patching for GB200/GB300 (and require users to bring their own sglang version). should add back later.
+ARG ENABLE_SGLANG_PATCH=1
+COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
+RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
+  cd /sgl-workspace/sglang && \
+  git update-index --refresh && \
+  git apply sglang.patch --3way && \
+  if grep -R -n '^<<<<<<< ' .; then \
+    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
+    exit 1; \
+  fi && \
+  rm sglang.patch; \
+fi
+
+# SGLang LoRA composite config fix: pass hf_text_config (not hf_config) to LoRAManager
+# so num_hidden_layers/hidden_size/vocab_size resolve correctly for composite models
+# like Qwen3.5 MoE (where these attrs live inside text_config, not at top level).
+# Upstreamable to sgl-project/sglang.
+RUN cd /sgl-workspace/sglang && \
+    sed -i 's/base_hf_config=self\.model_config\.hf_config,/base_hf_config=self.model_config.hf_text_config,/' \
+    python/sglang/srt/model_executor/model_runner.py
+
+# SGLang LoRA patches for MoE models (optional, separate PRs with overlapping files).
+# These are NOT applied by default — SGLang v0.5.9 already has base LoRA support.
+# To enable MoE LoRA patches, combine them into a single merged patch first:
+#   docker/patch/sglang-lora-14105-moe-layers.patch   — MoE LoRA layers + triton/jit kernels
+#   docker/patch/sglang-lora-17692-embedding-chunked.patch — chunked embedding LoRA
+#   docker/patch/sglang-lora-18511-tp-embedding.patch  — TP embedding LoRA
+#   docker/patch/sglang-lora-19710-moe-jit-kernel.patch — refined MoE JIT kernel
+#   docker/patch/sglang-lora-19711-moe-triton-kernel.patch — refined MoE triton kernel
+# These patches overlap on layers.py, mem_pool.py, utils.py, triton_ops/__init__.py
+# and cannot be applied sequentially without manual conflict resolution.
+
+# ====================================== Install main package ============================================
+
+ARG SLIME_REPO=Osmosis-AI/slime-rl.git
+ARG SLIME_BRANCH=feat/lora-mlflow
+RUN git clone -b ${SLIME_BRANCH} https://github.com/${SLIME_REPO} /root/slime && \
+    cd /root/slime && \
+    pip install -e . --no-deps
+
+# miles → slime import redirect: Megatron-LM (miles-main fork) has hardcoded
+# `from miles.xxx import yyy` — this symlink makes them resolve to slime.xxx
+RUN ln -s /root/slime/slime $(python3 -c "import site; print(site.getsitepackages()[0])")/miles
+
+RUN cd /root/slime/slime/backends/megatron_utils/kernels/int4_qat && \
+    pip install . --no-build-isolation
+
+WORKDIR /root/slime

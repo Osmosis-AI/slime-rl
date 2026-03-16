@@ -2,6 +2,7 @@ import logging
 import threading
 
 import ray
+import requests
 
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ class RolloutHealthMonitor:
 
     def __init__(self, server_group, args):
         self._server_group = server_group
+        self._args = args
 
         self._thread = None
         self._stop_event = None
@@ -29,8 +31,10 @@ class RolloutHealthMonitor:
         self._check_interval = args.rollout_health_check_interval
         self._check_timeout = args.rollout_health_check_timeout
         self._check_first_wait = args.rollout_health_check_first_wait
+        self._max_kill_ratio_per_round = getattr(args, "rollout_max_kill_ratio_per_round", 0.5)
         self._need_first_wait = True  # Need to wait after each resume
         self._is_checking_enabled = False  # Track if health checking should be active
+        self.total_kills = 0
 
     def start(self) -> bool:
         """Start the health monitor thread. Called once during initialization.
@@ -134,28 +138,84 @@ class RolloutHealthMonitor:
             if self._stop_event.wait(self._check_interval):
                 break
 
-    def _run_health_checks(self) -> None:
-        for rollout_engine_id, engine in enumerate(self._server_group.engines):
-            if self._stop_event is not None and self._stop_event.is_set():
-                break
-            if self._pause_event is not None and self._pause_event.is_set():
-                break
-            self._check_engine_health(rollout_engine_id, engine)
+    def _should_stop(self) -> bool:
+        return (self._stop_event is not None and self._stop_event.is_set()) or (
+            self._pause_event is not None and self._pause_event.is_set()
+        )
 
-    def _check_engine_health(self, rollout_engine_id, engine) -> None:
-        if engine is None:
-            logger.info(f"Skipping health check for engine {rollout_engine_id} (None)")
+    def _run_health_checks(self) -> None:
+        engines = self._server_group.engines
+
+        # Send all health checks in parallel
+        pending: dict[ray.ObjectRef, int] = {}
+        for engine_id, engine in enumerate(engines):
+            if self._should_stop():
+                return
+            if engine is None:
+                logger.info(f"Skipping health check for engine {engine_id} (None)")
+                continue
+            ref = engine.health_generate.remote(timeout=self._check_timeout)
+            pending[ref] = engine_id
+
+        if not pending:
             return
 
-        try:
-            ray.get(engine.health_generate.remote(timeout=self._check_timeout))
-        except Exception as e:
+        timeout = self._check_timeout + 5
+        ready, not_ready = ray.wait(list(pending.keys()), num_returns=len(pending), timeout=timeout)
+
+        failed_engine_ids = []
+        for ref in ready:
+            engine_id = pending[ref]
+            try:
+                ray.get(ref)
+            except Exception as e:
+                logger.error(
+                    f"Health check failed for rollout engine {engine_id} (ray error). "
+                    f"Killing actor. Exception: {e}"
+                )
+                failed_engine_ids.append(engine_id)
+            else:
+                logger.debug(f"Health check passed for rollout engine {engine_id}")
+
+        for ref in not_ready:
+            engine_id = pending[ref]
             logger.error(
-                f"Health check failed for rollout engine {rollout_engine_id} (ray timeout or error). Killing actor. Exception: {e}"
+                f"Health check timed out for rollout engine {engine_id} "
+                f"(no response within {timeout}s). Killing actor."
             )
-            self._kill_engine(rollout_engine_id=rollout_engine_id)
-        else:
-            logger.debug(f"Health check passed for rollout engine {rollout_engine_id}")
+            ray.cancel(ref, force=True)
+            failed_engine_ids.append(engine_id)
+
+        if not failed_engine_ids:
+            return
+
+        # Anti-cascade: cap kills per round to prevent mass kill from transient failures
+        kill_list = sorted(set(failed_engine_ids))
+        max_kills = max(1, int(len(engines) * self._max_kill_ratio_per_round))
+        if len(kill_list) > max_kills:
+            logger.warning(
+                f"Anti-cascade: {len(kill_list)} engines to kill but limiting to {max_kills} this round "
+                f"(max_kill_ratio={self._max_kill_ratio_per_round})"
+            )
+            kill_list = kill_list[:max_kills]
+
+        self.total_kills += len(kill_list)
+
+        for engine_id in kill_list:
+            self._kill_engine(rollout_engine_id=engine_id)
+
+    def _notify_router_remove_worker(self, worker_url: str) -> None:
+        """Notify the router to remove a dead worker so it stops routing requests to it."""
+        router_ip = self._server_group.router_ip
+        router_port = self._server_group.router_port
+        if not router_ip or not router_port:
+            return
+        try:
+            url = f"http://{router_ip}:{router_port}/remove_worker"
+            requests.post(url, params={"url": worker_url}, timeout=5.0)
+            logger.info(f"Notified router to remove worker {worker_url}")
+        except Exception as e:
+            logger.warning(f"Failed to notify router to remove worker {worker_url}: {e}")
 
     def _kill_engine(self, rollout_engine_id: int):
         logger.info(f"Killing server group {rollout_engine_id}...")

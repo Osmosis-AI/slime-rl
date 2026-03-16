@@ -41,6 +41,9 @@ class SlimeRouter:
         # Quarantined workers excluded from routing pool
         self.dead_workers: set[str] = set()
         self.max_weight_version = None
+        # When True, health check loop skips checking (used during memory offload transitions)
+        # Start paused — resume_health_checks is called at the start of generate()/eval()
+        self._health_checks_paused = True
 
         max_connections = getattr(args, "slime_router_max_connections", None)
         if max_connections is None:
@@ -67,8 +70,12 @@ class SlimeRouter:
         """Setup all the HTTP routes"""
         # sglang-router api
         self.app.post("/add_worker")(self.add_worker)
+        self.app.post("/remove_worker")(self.remove_worker)
         self.app.get("/list_workers")(self.list_workers)
         self.app.post("/retrieve_from_text")(self.retrieve_from_text)
+        # Health check pause/resume (used during memory offload transitions)
+        self.app.post("/pause_health_checks")(self.pause_health_checks)
+        self.app.post("/resume_health_checks")(self.resume_health_checks)
         # Catch-all route for proxying to SGLang - must be registered LAST
         self.app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])(self.proxy)
 
@@ -94,6 +101,9 @@ class SlimeRouter:
         while True:
             try:
                 await asyncio.sleep(interval)
+
+                if self._health_checks_paused:
+                    continue
 
                 urls = [u for u in self.worker_request_counts if u not in self.dead_workers]
                 if not urls:
@@ -187,18 +197,61 @@ class SlimeRouter:
                 status_code=400, content={"error": "worker_url is required (use query ?url=... or JSON body)"}
             )
 
-        # Add if new, keep a simple request count per worker
-        if worker_url not in self.worker_request_counts:
-            self.worker_request_counts[worker_url] = 0
-            self.worker_failure_counts[worker_url] = 0
-            if self.verbose:
-                print(f"[slime-router] Added new worker: {worker_url}")
+        is_new = worker_url not in self.worker_request_counts
+        self.worker_request_counts.setdefault(worker_url, 0)
+        self.worker_failure_counts[worker_url] = 0
+        self.dead_workers.discard(worker_url)
+
+        if is_new and self.verbose:
+            print(f"[slime-router] Added new worker: {worker_url}")
+        if not is_new:
+            logger.info(f"[slime-router] Re-registered worker {worker_url}, cleared dead/failure state")
 
         return {"status": "success", "worker_urls": self.worker_request_counts}
+
+    async def remove_worker(self, request: Request):
+        """Remove a worker from the router.
+        Supports providing the URL via query string or JSON body.
+        """
+        worker_url = request.query_params.get("url") or request.query_params.get("worker_url")
+
+        if not worker_url:
+            body = await request.body()
+            payload = json.loads(body) if body else {}
+            worker_url = payload.get("url") or payload.get("worker_url")
+
+        if not worker_url:
+            return JSONResponse(
+                status_code=400, content={"error": "worker_url is required (use query ?url=... or JSON body)"}
+            )
+
+        self.worker_request_counts.pop(worker_url, None)
+        self.worker_failure_counts.pop(worker_url, None)
+        self.dead_workers.discard(worker_url)
+        logger.info(f"[slime-router] Removed worker: {worker_url}")
+
+        return {"status": "success"}
 
     async def list_workers(self, request: Request):
         """List all registered workers"""
         return {"urls": list(self.worker_request_counts.keys())}
+
+    async def pause_health_checks(self, request: Request):
+        """Pause health checks during memory offload transitions."""
+        self._health_checks_paused = True
+        logger.info("[slime-router] Health checks paused (memory offload in progress)")
+        return {"status": "paused"}
+
+    async def resume_health_checks(self, request: Request):
+        """Resume health checks after memory onload, clearing stale failure state."""
+        revived = list(self.dead_workers)
+        self.dead_workers.clear()
+        self.worker_failure_counts = {url: 0 for url in self.worker_failure_counts}
+        self._health_checks_paused = False
+        if revived:
+            logger.info(f"[slime-router] Revived {len(revived)} workers marked dead during offload: {revived}")
+        logger.info("[slime-router] Health checks resumed")
+        return {"status": "resumed", "revived_workers": revived}
 
     async def retrieve_from_text(self, request: Request):
         """Get token information from text input"""
