@@ -51,8 +51,13 @@ RUN NVCC_APPEND_FLAGS="--threads 4" \
   --no-build-isolation \
   --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" git+https://github.com/NVIDIA/apex.git@f199212da7234bf9be2244cad5b9bfa2f5fe2675
 
+# Pin to pre-upgrade commit: 038e8e5a2 ("Upgrade Megatron from Dec 17 to Feb 13")
+# added experimental_attention_variant assertion incompatible with Megatron-Bridge's
+# qwen35_vl_provider. Use parent commit 07220d28f until Bridge is updated.
+ARG MEGATRON_COMMIT=07220d28fc024f8455b58a03874acf5bc62adb27
 RUN git clone -b ${MEGATRON_BRANCH} https://github.com/${MEGATRON_REPO}.git Megatron-LM --recursive && \
     cd Megatron-LM && \
+    git checkout ${MEGATRON_COMMIT} && \
     pip install -e .
 
 RUN pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@1bc80bb0d63db3b6af34b6c5e6139cf470fe1fcc --no-cache-dir --force-reinstall
