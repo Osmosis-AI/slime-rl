@@ -551,7 +551,7 @@ def train(
             and mpu.get_tensor_model_parallel_rank() == 0
             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
         ):
-            print("Reset optimizer states")
+            logger.info("Reset optimizer states")
         for chained_optimizer in optimizer.chained_optimizers:
             for group in chained_optimizer.optimizer.param_groups:
                 if "step" in group:
@@ -719,7 +719,6 @@ def save(
         )
 
     if args.save and torch.distributed.get_rank() == 0:
-        from slime.utils import logging_utils
         checkpoint_dir = str(Path(args.save) / f"iter_{iteration:07d}")
         logging_utils.log_checkpoint(checkpoint_dir, metadata={"iteration": iteration})
 
@@ -792,7 +791,7 @@ def initialize_model_and_optimizer(
         from slime.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync
 
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
-        print("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
+        logger.info("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
 
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role

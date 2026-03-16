@@ -65,9 +65,10 @@ RUN git clone -b ${MEGATRON_BRANCH} https://github.com/${MEGATRON_REPO}.git Mega
 
 RUN pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@1bc80bb0d63db3b6af34b6c5e6139cf470fe1fcc --no-cache-dir --force-reinstall
 
-# Megatron-Bridge: Osmosis-AI merged fork with native Qwen3.5 bridges + LoRA export_adapter_weights
-# Based on coding-famer/qwen35 (Qwen3.5 bridge) + export_adapter_weights for LoRA weight sync
-RUN pip install git+https://github.com/Osmosis-AI/Megatron-Bridge.git@merged-qwen35-lora --no-deps --no-build-isolation
+# Megatron-Bridge: Osmosis-AI fork — Qwen3.5 bridges + LoRA export_adapter_weights
+# Pinned to known-working commit (includes hf_param=None guard for MoE expert LoRA)
+ARG BRIDGE_COMMIT=17187e4769afaa7782212880d68719cf385fe39e
+RUN pip install git+https://github.com/Osmosis-AI/Megatron-Bridge.git@${BRIDGE_COMMIT} --no-deps --no-build-isolation
 # Stub: merged-qwen35-lora references mla_provider (from upstream rebase) but doesn't include it.
 # Qwen3.5 isn't MLA so a stub class satisfies the issubclass check.
 RUN echo 'class MLAModelProvider:\n    pass' > $(python3 -c "import megatron.bridge.models; print(megatron.bridge.models.__path__[0])")/mla_provider.py
@@ -143,7 +144,7 @@ RUN cd /sgl-workspace/sglang && \
 # ====================================== Install main package ============================================
 
 ARG SLIME_REPO=Osmosis-AI/slime-rl.git
-ARG SLIME_BRANCH=feat/lora-mlflow
+ARG SLIME_BRANCH=main
 RUN git clone -b ${SLIME_BRANCH} https://github.com/${SLIME_REPO} /root/slime && \
     cd /root/slime && \
     pip install -e . --no-deps
