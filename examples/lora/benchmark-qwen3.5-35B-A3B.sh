@@ -96,7 +96,6 @@ SHARED_ARGS=(
    --sglang-ep-size 8
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
    --sglang-max-running-requests 512
-   --offload-train
 
    --attention-dropout 0.0
    --hidden-dropout 0.0
@@ -157,6 +156,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${MODEL_ARGS[@]} \
    ${SHARED_ARGS[@]} \
    --mlflow-run-name lora-r32-benchmark \
+   --offload-train \
    --lr 1e-4 \
    --lora-rank 32 \
    --lora-alpha 32 \
@@ -186,7 +186,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${MODEL_ARGS[@]} \
    ${SHARED_ARGS[@]} \
    --mlflow-run-name full-ft-benchmark \
-   --sglang-mem-fraction-static 0.5
+   --moe-token-dispatcher-type flex
 set +x
 
 BASELINE_EXIT=$?
