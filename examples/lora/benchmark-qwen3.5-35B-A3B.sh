@@ -28,7 +28,7 @@ else
 fi
 
 EXPERIMENT_NAME="slime-lora-benchmark"
-NUM_ROLLOUT=20
+NUM_ROLLOUT=100
 
 # Shared args across both runs
 SHARED_ARGS=(
@@ -54,7 +54,7 @@ SHARED_ARGS=(
    --rollout-temperature 1
    --global-batch-size 128
 
-   --eval-interval 10
+   --eval-interval 25
    --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
    --eval-input-key prompt
    --n-samples-per-eval-prompt 1

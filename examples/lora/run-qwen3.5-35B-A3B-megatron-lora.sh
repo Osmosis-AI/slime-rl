@@ -55,7 +55,7 @@ ROLLOUT_ARGS=(
 )
 
 EVAL_ARGS=(
-   --eval-interval 10
+   --eval-interval 25
    --eval-prompt-data gsm8k /root/gsm8k/test.parquet
    --n-samples-per-eval-prompt 1
    --eval-max-response-len 1024
@@ -81,7 +81,7 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --kl-loss-coef 0.00
+   --kl-loss-coef 0.01
    --kl-loss-type low_var_kl
    --kl-coef 0.00
    --entropy-coef 0.00
@@ -91,7 +91,8 @@ GRPO_ARGS=(
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-5
+   --lr 5e-5
+   --clip-grad 1.0
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9

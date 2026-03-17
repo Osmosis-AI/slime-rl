@@ -49,7 +49,7 @@ ROLLOUT_ARGS=(
 )
 
 EVAL_ARGS=(
-   --eval-interval 10
+   --eval-interval 25
    --eval-prompt-data gsm8k /root/gsm8k/test.parquet
    --n-samples-per-eval-prompt 1
    --eval-max-response-len 1024
@@ -104,18 +104,11 @@ MLFLOW_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 8
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static 0.35
    --sglang-ep-size 8
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 
-   # MTP speculative decoding
-   --sglang-speculative-algorithm EAGLE
-   --sglang-speculative-num-steps 2
-   --sglang-speculative-eagle-topk 1
-   --sglang-speculative-num-draft-tokens 3
-
    --sglang-max-running-requests 512
-   --offload-train
 )
 
 MISC_ARGS=(
@@ -124,7 +117,7 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
-   --moe-token-dispatcher-type alltoall
+   --moe-token-dispatcher-type flex
 )
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}

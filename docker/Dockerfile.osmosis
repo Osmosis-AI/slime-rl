@@ -5,7 +5,7 @@ FROM slimerl/sglang:${SGLANG_IMAGE_TAG} AS sglang
 
 ARG PATCH_VERSION=latest
 ARG MEGATRON_REPO=Osmosis-AI/Megatron-LM
-ARG MEGATRON_BRANCH=miles-main
+ARG MEGATRON_BRANCH=main
 
 ARG ENABLE_CUDA_13=0
 
@@ -51,27 +51,15 @@ RUN NVCC_APPEND_FLAGS="--threads 4" \
   --no-build-isolation \
   --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" git+https://github.com/NVIDIA/apex.git@f199212da7234bf9be2244cad5b9bfa2f5fe2675
 
-# Megatron-LM: Osmosis-AI fork (miles-main)
-# Patch: remove experimental_attention_variant assertion in gpt_layer_specs.py.
-# Bridge's qwen35_vl_provider sets experimental_attention_variant="gated_delta_net"
-# then calls get_gpt_decoder_block_spec() which rejects non-None variants.
-# The Bridge handles hybrid GDN/attention layers manually via _patch_standard_attention_specs
-# so the assertion just blocks a valid code path. Fix properly upstream in Megatron-Bridge.
+# Megatron-LM: Osmosis-AI fork (assertion fix baked into main branch)
 RUN git clone -b ${MEGATRON_BRANCH} https://github.com/${MEGATRON_REPO}.git Megatron-LM --recursive && \
     cd Megatron-LM && \
-    sed -i '/assert config\.experimental_attention_variant is None/,/^    )/d' \
-        megatron/core/models/gpt/gpt_layer_specs.py && \
     pip install -e .
 
 RUN pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@1bc80bb0d63db3b6af34b6c5e6139cf470fe1fcc --no-cache-dir --force-reinstall
 
-# Megatron-Bridge: Osmosis-AI fork — Qwen3.5 bridges + LoRA export_adapter_weights
-# Pinned to known-working commit (includes hf_param=None guard for MoE expert LoRA)
-ARG BRIDGE_COMMIT=17187e4769afaa7782212880d68719cf385fe39e
-RUN pip install git+https://github.com/Osmosis-AI/Megatron-Bridge.git@${BRIDGE_COMMIT} --no-deps --no-build-isolation
-# Stub: merged-qwen35-lora references mla_provider (from upstream rebase) but doesn't include it.
-# Qwen3.5 isn't MLA so a stub class satisfies the issubclass check.
-RUN echo 'class MLAModelProvider:\n    pass' > $(python3 -c "import megatron.bridge.models; print(megatron.bridge.models.__path__[0])")/mla_provider.py
+# Megatron-Bridge: Osmosis-AI fork (MLAModelProvider stub baked into main branch)
+RUN pip install git+https://github.com/Osmosis-AI/Megatron-Bridge.git@main --no-deps --no-build-isolation
 
 RUN pip install nvidia-modelopt[torch]>=0.42.0 --no-build-isolation
 
@@ -105,8 +93,6 @@ RUN pip install "numpy<2"
 RUN rm -rf /root/.cache/pip /root/flash-attention
 
 # ====================================== Patches ============================================
-
-# Megatron-LM assertion patch applied inline during clone (see above).
 
 # TODO temporarily skip patching for GB200/GB300 (and require users to bring their own sglang version). should add back later.
 ARG ENABLE_SGLANG_PATCH=1
