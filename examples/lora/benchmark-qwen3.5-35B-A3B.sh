@@ -186,10 +186,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${MODEL_ARGS[@]} \
    ${SHARED_ARGS[@]} \
    --mlflow-run-name full-ft-benchmark \
-   --sglang-speculative-algorithm EAGLE \
-   --sglang-speculative-num-steps 2 \
-   --sglang-speculative-eagle-topk 1 \
-   --sglang-speculative-num-draft-tokens 3
+   --sglang-mem-fraction-static 0.5
 set +x
 
 BASELINE_EXIT=$?
