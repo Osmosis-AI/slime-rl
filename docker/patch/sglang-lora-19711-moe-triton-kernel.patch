@@ -16,7 +16,7 @@ index 71eb1fea4837..5d4684fbba4e 100644
      "chunked_sgmv_lora_expand_forward",
 +    "fused_moe_lora",
      "embedding_lora_a_fwd",
- ]
+ 
 diff --git a/python/sglang/srt/lora/triton_ops/fused_moe_lora_kernel.py b/python/sglang/srt/lora/triton_ops/fused_moe_lora_kernel.py
 new file mode 100644
 index 000000000000..0d5ae426d31f

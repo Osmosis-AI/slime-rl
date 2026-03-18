@@ -1,13 +1,13 @@
 #!/bin/bash
 # LoRA vs Full Fine-Tuning Benchmark for Qwen3.5-35B-A3B
-# Runs both configs sequentially (20 rollout steps each), logging to MLflow.
+# Runs both configs sequentially (60 rollout steps each), logging to MLflow.
 #
 # Usage:
 #   bash examples/lora/benchmark-qwen3.5-35B-A3B.sh
 #
 # After completion, generate the comparison report:
 #   python tools/benchmark_report.py \
-#       --experiment slime-lora-benchmark \
+#       --experiment slime-osmosis-benchmark \
 #       --lora-run lora-r32-benchmark \
 #       --baseline-run full-ft-benchmark
 
@@ -27,8 +27,9 @@ else
     HAS_NVLINK=0
 fi
 
-EXPERIMENT_NAME="slime-lora-benchmark"
-NUM_ROLLOUT=100
+EXPERIMENT_NAME="slime-osmosis-benchmark"
+LORA_STEPS=60
+FT_STEPS=60
 
 # Shared args across both runs
 SHARED_ARGS=(
@@ -47,14 +48,12 @@ SHARED_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --rm-type math
-   --num-rollout $NUM_ROLLOUT
    --rollout-batch-size 16
    --n-samples-per-prompt 8
    --rollout-max-response-len 1024
    --rollout-temperature 1
    --global-batch-size 128
 
-   --eval-interval 25
    --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
    --eval-input-key prompt
    --n-samples-per-eval-prompt 1
@@ -142,7 +141,7 @@ start_ray() {
 # ============================================================
 echo ""
 echo "============================================================"
-echo "  Phase 1/2: LoRA r=32 ($NUM_ROLLOUT rollout steps)"
+echo "  Phase 1/2: LoRA r=32 ($LORA_STEPS rollout steps)"
 echo "============================================================"
 echo ""
 
@@ -155,6 +154,8 @@ ray job submit --address="http://127.0.0.1:8265" \
    -- python3 train.py \
    ${MODEL_ARGS[@]} \
    ${SHARED_ARGS[@]} \
+   --num-rollout $LORA_STEPS \
+   --eval-interval 10 \
    --mlflow-run-name lora-r32-benchmark \
    --offload-train \
    --lr 5e-5 \
@@ -173,7 +174,7 @@ echo "==> LoRA run exited with code $LORA_EXIT"
 # ============================================================
 echo ""
 echo "============================================================"
-echo "  Phase 2/2: Full Fine-Tuning ($NUM_ROLLOUT rollout steps)"
+echo "  Phase 2/2: Full Fine-Tuning ($FT_STEPS rollout steps)"
 echo "============================================================"
 echo ""
 
@@ -186,8 +187,11 @@ ray job submit --address="http://127.0.0.1:8265" \
    -- python3 train.py \
    ${MODEL_ARGS[@]} \
    ${SHARED_ARGS[@]} \
+   --num-rollout $FT_STEPS \
+   --eval-interval 10 \
    --mlflow-run-name full-ft-benchmark \
-   --moe-token-dispatcher-type flex
+   --moe-token-dispatcher-type flex \
+   --sglang-mem-fraction-static 0.35
 set +x
 
 BASELINE_EXIT=$?

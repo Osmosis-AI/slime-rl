@@ -28,6 +28,7 @@ from slime.utils.processing_utils import (
     load_tokenizer,
 )
 from slime.utils.types import Sample
+from slime.backends.megatron_utils.lora_utils import LORA_ADAPTER_NAME, is_lora_enabled
 
 from .rm_hub import async_rm, batched_async_rm
 
@@ -161,6 +162,9 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
+
+    if is_lora_enabled(args):
+        payload["lora_path"] = LORA_ADAPTER_NAME
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
