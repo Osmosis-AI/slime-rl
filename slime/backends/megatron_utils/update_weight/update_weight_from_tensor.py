@@ -179,6 +179,7 @@ class UpdateWeightFromTensor:
         all_long_lived_tensors = []
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
+<<<<<<< HEAD
             results = ray.get(refs)
             _check_weight_sync_results(results, is_lora=self.is_lora)
             all_long_lived_tensors.append(long_lived_tensors)
@@ -190,8 +191,19 @@ class UpdateWeightFromTensor:
                 "No adapter weights were sent to the rollout engine. This usually means "
                 "the Megatron-Bridge or SGLang version is incompatible."
             )
+=======
+            ray.get(refs)
+            # Free GPU tensors so the caching allocator can reuse the blocks,
+            # then release CUDA IPC cache entries whose consumers (sglang engines)
+            # have already closed their IPC handles.
+            del long_lived_tensors, hf_named_tensors
+            torch.cuda.ipc_collect()
+>>>>>>> upstream/main
 
         dist.barrier(group=get_gloo_group())
+        # After the barrier all engines have returned, so every rank's last-chunk
+        # IPC handles are now released by the consumers.  Clean them up.
+        torch.cuda.ipc_collect()
 
         # int4/fp4 post_process
         if rank == 0:
@@ -284,6 +296,10 @@ def _send_to_colocated_engine(
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     if ipc_gather_group is None:
         return [], None
+<<<<<<< HEAD
+=======
+
+>>>>>>> upstream/main
     long_live_tensors = []
 
     if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
