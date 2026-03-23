@@ -16,15 +16,14 @@ minRunners: 0
 template:
   spec:
     restartPolicy: Never
+    priorityClassName: default
+
+    # Required for Ray/NCCL multi-GPU communication
     hostIPC: true
 
     containers:
     - name: runner
       image: slimerl/slime:latest
-      command: ["/home/runner/run.sh"]
-      env:
-      - name: ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER
-        value: "false"
       resources:
         limits:
           nvidia.com/gpu: "8"
