@@ -30,7 +30,7 @@ jobs:
     if: (github.event_name == 'workflow_dispatch') || (github.event.pull_request && contains(github.event.pull_request.labels.*.name, 'run-ci-short'))
 
 
-    runs-on: self-hosted
+    runs-on: limes-gpu-runners
     container:
       image: slimerl/slime:latest
       options: >
@@ -92,7 +92,7 @@ jobs:
     if: (github.event_name == 'workflow_dispatch') || (github.event.pull_request && contains(github.event.pull_request.labels.*.name, 'run-ci-sglang-config'))
 
 
-    runs-on: self-hosted
+    runs-on: limes-gpu-runners
     container:
       image: slimerl/slime:latest
       options: >
@@ -154,7 +154,7 @@ jobs:
     if: (github.event_name == 'workflow_dispatch') || (github.event.pull_request && contains(github.event.pull_request.labels.*.name, 'run-ci-megatron'))
 
 
-    runs-on: self-hosted
+    runs-on: limes-gpu-runners
     container:
       image: slimerl/slime:latest
       options: >
@@ -176,7 +176,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        info: [{"num_gpus": 8, "test_file": "test_quick_start_glm4_9B.py"}, {"num_gpus": 8, "test_file": "test_qwen3_30B_A3B.py", "use_deepep": "1", "use_fp8_rollout": "1"}, {"enable_eval": "0", "num_gpus": 8, "test_file": "test_qwen3_30B_A3B_r3.py", "use_deepep": "1", "use_fp8_rollout": "1"}, {"enable_eval": "0", "num_gpus": 8, "test_file": "test_qwen3_30B_A3B_r3.py"}, {"num_gpus": 8, "test_file": "test_qwen3_4B_ppo.py"}, {"num_gpus": 8, "test_file": "test_qwen3_4B_ppo_train_critic_only.py"}, {"num_gpus": 8, "test_file": "test_moonlight_16B_A3B.py"}, {"enable_eval": "0", "num_gpus": 8, "test_file": "test_moonlight_16B_A3B_r3.py"}, {"num_gpus": 8, "test_file": "test_mimo_7B_mtp_only_grad.py"}, {"num_gpus": 8, "test_file": "test_qwen2.5_0.5B_debug_rollout_then_train.py"}, {"num_gpus": 8, "test_file": "test_qwen2.5_0.5B_opd_sglang.py"}]
+        info: [{"num_gpus": 8, "test_file": "test_quick_start_glm4_9B.py"}, {"num_gpus": 8, "test_file": "test_qwen3_5_35B_A3B_gsm8k.py"}, {"num_gpus": 8, "test_file": "test_qwen3_30B_A3B.py", "use_deepep": "1", "use_fp8_rollout": "1"}, {"enable_eval": "0", "num_gpus": 8, "test_file": "test_qwen3_30B_A3B_r3.py", "use_deepep": "1", "use_fp8_rollout": "1"}, {"enable_eval": "0", "num_gpus": 8, "test_file": "test_qwen3_30B_A3B_r3.py"}, {"num_gpus": 8, "test_file": "test_qwen3_4B_ppo.py"}, {"num_gpus": 8, "test_file": "test_qwen3_4B_ppo_train_critic_only.py"}, {"num_gpus": 8, "test_file": "test_moonlight_16B_A3B.py"}, {"enable_eval": "0", "num_gpus": 8, "test_file": "test_moonlight_16B_A3B_r3.py"}, {"num_gpus": 8, "test_file": "test_mimo_7B_mtp_only_grad.py"}, {"num_gpus": 8, "test_file": "test_qwen2.5_0.5B_debug_rollout_then_train.py"}, {"num_gpus": 8, "test_file": "test_qwen2.5_0.5B_opd_sglang.py"}]
     defaults:
       run:
         working-directory: ${{ github.workspace }}
@@ -216,7 +216,7 @@ jobs:
     if: (github.event_name == 'workflow_dispatch') || (github.event.pull_request && contains(github.event.pull_request.labels.*.name, 'run-ci-precision'))
 
 
-    runs-on: self-hosted
+    runs-on: limes-gpu-runners
     container:
       image: slimerl/slime:latest
       options: >
@@ -278,7 +278,7 @@ jobs:
     if: (github.event_name == 'workflow_dispatch') || (github.event.pull_request && contains(github.event.pull_request.labels.*.name, 'run-ci-ckpt'))
 
 
-    runs-on: self-hosted
+    runs-on: limes-gpu-runners
     container:
       image: slimerl/slime:latest
       options: >
@@ -397,7 +397,7 @@ jobs:
     if: (github.event_name == 'workflow_dispatch') || (github.event.pull_request && contains(github.event.pull_request.labels.*.name, 'run-ci-image'))
 
 
-    runs-on: self-hosted
+    runs-on: limes-gpu-runners
     container:
       image: slimerl/slime-test:latest
       options: >
@@ -457,7 +457,7 @@ jobs:
 
   e2e-test-changed-detect:
     if: (github.event_name == 'workflow_dispatch') || (github.event.pull_request && contains(github.event.pull_request.labels.*.name, 'run-ci-changed'))
-    runs-on: self-hosted
+    runs-on: limes-gpu-runners
     container:
       image: slimerl/slime:latest
       options: >
@@ -507,7 +507,7 @@ jobs:
   e2e-test-changed:
     needs: e2e-test-changed-detect
     if: needs.e2e-test-changed-detect.outputs.has_tests == 'true'
-    runs-on: self-hosted
+    runs-on: limes-gpu-runners
     container:
       image: slimerl/slime:latest
       options: >

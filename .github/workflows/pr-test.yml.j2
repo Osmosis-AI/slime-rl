@@ -20,6 +20,7 @@
       'label': 'run-ci-megatron',
       'tests': [
         {'test_file': 'test_quick_start_glm4_9B.py', 'num_gpus': 8},
+        {'test_file': 'test_qwen3_5_35B_A3B_gsm8k.py', 'num_gpus': 8},
         {'test_file': 'test_qwen3_30B_A3B.py', 'num_gpus': 8, 'use_deepep': '1', 'use_fp8_rollout': '1'},
         {'test_file': 'test_qwen3_30B_A3B_r3.py', 'num_gpus': 8, 'use_deepep': '1', 'use_fp8_rollout': '1', 'enable_eval': '0'},
         {'test_file': 'test_qwen3_30B_A3B_r3.py', 'num_gpus': 8, 'enable_eval': '0'},
@@ -109,7 +110,7 @@ jobs:
 <% if config.get('cpu') %>
     runs-on: ubuntu-latest
 <% else %>
-    runs-on: self-hosted
+    runs-on: limes-gpu-runners
     container:
       image: << config.image if config.image else 'slimerl/slime:latest' >>
       options: >
@@ -186,7 +187,7 @@ jobs:
 
   e2e-test-changed-detect:
     if: (github.event_name == 'workflow_dispatch') || (github.event.pull_request && contains(github.event.pull_request.labels.*.name, 'run-ci-changed'))
-    runs-on: self-hosted
+    runs-on: limes-gpu-runners
     container:
       image: slimerl/slime:latest
       options: >
@@ -236,7 +237,7 @@ jobs:
   e2e-test-changed:
     needs: e2e-test-changed-detect
     if: needs.e2e-test-changed-detect.outputs.has_tests == 'true'
-    runs-on: self-hosted
+    runs-on: limes-gpu-runners
     container:
       image: slimerl/slime:latest
       options: >
