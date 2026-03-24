@@ -21,10 +21,23 @@ template:
     # Required for Ray/NCCL multi-GPU communication
     hostIPC: true
 
+    initContainers:
+    - name: setup-runner
+      image: slimerl/slime:latest
+      command: ["bash", "-c"]
+      args:
+      - |
+        RUNNER_VERSION=2.333.0
+        curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
+          | tar xz -C /runner-tmp
+      volumeMounts:
+      - mountPath: /runner-tmp
+        name: runner-bin
+
     containers:
     - name: runner
-      image: ghcr.io/osmosis-ai/slime-rl/arc-gpu-runner:latest
-      command: ["/home/runner/run.sh"]
+      image: slimerl/slime:latest
+      command: ["/runner-tmp/run.sh"]
       env:
       - name: RUNNER_ALLOW_RUNASROOT
         value: "1"
@@ -38,6 +51,8 @@ template:
         name: dshm
       - mountPath: /root/models
         name: ci-storage
+      - mountPath: /runner-tmp
+        name: runner-bin
 
     volumes:
     - name: dshm
@@ -47,3 +62,5 @@ template:
     - name: ci-storage
       persistentVolumeClaim:
         claimName: limes-ci-pvc
+    - name: runner-bin
+      emptyDir: {}
