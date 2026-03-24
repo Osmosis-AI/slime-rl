@@ -1,0 +1,66 @@
+# Helm values for the ARC runner scale set
+# Deploy with:
+#   helm install limes-gpu-runners \
+#     --namespace arc-runners \
+#     --create-namespace \
+#     -f infra/k8s/arc-runners-values.yaml \
+#     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+
+githubConfigUrl: "https://github.com/Osmosis-AI/slime-rl"
+githubConfigSecret: arc-github-secret
+
+# 1 node with 8 GPUs = 1 job at a time
+maxRunners: 1
+minRunners: 0
+
+template:
+  spec:
+    restartPolicy: Never
+    priorityClassName: ci
+
+    # Required for Ray/NCCL multi-GPU communication
+    hostIPC: true
+
+    initContainers:
+    - name: setup-runner
+      image: osmosisdocker/limes:latest
+      command: ["bash", "-c"]
+      args:
+      - |
+        RUNNER_VERSION=2.333.0
+        curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
+          | tar xz -C /runner-tmp
+      volumeMounts:
+      - mountPath: /runner-tmp
+        name: runner-bin
+
+    containers:
+    - name: runner
+      image: osmosisdocker/limes:latest
+      command: ["/runner-tmp/run.sh"]
+      env:
+      - name: RUNNER_ALLOW_RUNASROOT
+        value: "1"
+      resources:
+        limits:
+          nvidia.com/gpu: "8"
+      securityContext:
+        privileged: true
+      volumeMounts:
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /root/models
+        name: ci-storage
+      - mountPath: /runner-tmp
+        name: runner-bin
+
+    volumes:
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Gi
+    - name: ci-storage
+      persistentVolumeClaim:
+        claimName: limes-ci-pvc
+    - name: runner-bin
+      emptyDir: {}

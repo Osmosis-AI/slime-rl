@@ -1,0 +1,35 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-models
+  namespace: arc-runners
+spec:
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: seeder
+        image: slimerl/slime:latest
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+          mkdir -p /root/models
+
+          echo "==> Downloading Qwen3.5-35B-A3B..."
+          hf download Qwen/Qwen3.5-35B-A3B --local-dir /root/models/Qwen3.5-35B-A3B
+
+          echo "==> Done seeding models."
+        resources:
+          limits:
+            memory: "32Gi"
+            cpu: "8"
+        volumeMounts:
+        - mountPath: /root/models
+          name: ci-storage
+      volumes:
+      - name: ci-storage
+        persistentVolumeClaim:
+          claimName: limes-ci-pvc
