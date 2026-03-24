@@ -94,7 +94,7 @@ ROLLOUT_ARGS=(
    --num-rollout 531
    --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --rollout-max-response-len 4096
+   --rollout-max-response-len 8192
    --rollout-temperature 1
 
    --global-batch-size 256
@@ -105,7 +105,7 @@ EVAL_ARGS=(
    --eval-prompt-data aime ${EVAL_DATA}
    --eval-input-key prompt
    --n-samples-per-eval-prompt 1
-   --eval-max-response-len 4096
+   --eval-max-response-len 8192
    --eval-top-k 1
 )
 
@@ -162,7 +162,7 @@ SGLANG_ARGS=(
    --sglang-ep-size 8
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 
-   --sglang-max-running-requests 512
+   --sglang-max-running-requests 256
    --offload-train
 )
 
