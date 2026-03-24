@@ -16,7 +16,7 @@ minRunners: 0
 template:
   spec:
     restartPolicy: Never
-    priorityClassName: default
+    priorityClassName: ci
 
     # Required for Ray/NCCL multi-GPU communication
     hostIPC: true
