@@ -192,7 +192,6 @@ RUNTIME_ENV_JSON="{
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
     \"SGLANG_DISABLE_CUDNN_CHECK\": \"1\",
-    \"PYTORCH_CUDA_ALLOC_CONF\": \"expandable_segments:True\",
     \"no_proxy\": \"${no_proxy}\"
   }
 }"
