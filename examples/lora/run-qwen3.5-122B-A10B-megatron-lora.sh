@@ -73,7 +73,7 @@ CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}
    --megatron-to-hf-mode bridge
    --save ${CHECKPOINT_DIR}
-   --save-interval 50
+   --save-interval 20
 )
 
 LORA_ARGS=(
