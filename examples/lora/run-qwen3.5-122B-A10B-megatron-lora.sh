@@ -94,7 +94,7 @@ ROLLOUT_ARGS=(
    --num-rollout 531
    --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --rollout-max-response-len 16384
+   --rollout-max-response-len 12288
    --system-prompt "Think concisely and efficiently. Provide your reasoning, then put your final answer within \\boxed{}."
    --rollout-temperature 1
 
@@ -106,7 +106,7 @@ EVAL_ARGS=(
    --eval-prompt-data aime ${EVAL_DATA}
    --eval-input-key prompt
    --n-samples-per-eval-prompt 1
-   --eval-max-response-len 16384
+   --eval-max-response-len 12288
    --eval-top-k 1
 )
 
@@ -170,8 +170,6 @@ SGLANG_ARGS=(
 MISC_ARGS=(
    --attention-dropout 0.0
    --hidden-dropout 0.0
-   --accumulate-allreduce-grads-in-fp32
-   --attention-softmax-in-fp32
    --attention-backend flash
    --moe-token-dispatcher-type alltoall
 )
@@ -194,6 +192,7 @@ RUNTIME_ENV_JSON="{
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
     \"SGLANG_DISABLE_CUDNN_CHECK\": \"1\",
+    \"PYTORCH_CUDA_ALLOC_CONF\": \"expandable_segments:True\",
     \"no_proxy\": \"${no_proxy}\"
   }
 }"
