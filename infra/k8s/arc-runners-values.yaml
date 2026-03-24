@@ -23,16 +23,11 @@ template:
 
     containers:
     - name: runner
-      image: slimerl/slime:latest
+      image: ghcr.io/osmosis-ai/slime-rl/arc-gpu-runner:latest
+      command: ["/home/runner/run.sh"]
       env:
-      - name: http_proxy
-        value: ""
-      - name: https_proxy
-        value: ""
-      - name: HTTP_PROXY
-        value: ""
-      - name: HTTPS_PROXY
-        value: ""
+      - name: RUNNER_ALLOW_RUNASROOT
+        value: "1"
       resources:
         limits:
           nvidia.com/gpu: "8"
