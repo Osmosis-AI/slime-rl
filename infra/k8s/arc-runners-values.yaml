@@ -24,6 +24,15 @@ template:
     containers:
     - name: runner
       image: slimerl/slime:latest
+      env:
+      - name: http_proxy
+        value: ""
+      - name: https_proxy
+        value: ""
+      - name: HTTP_PROXY
+        value: ""
+      - name: HTTPS_PROXY
+        value: ""
       resources:
         limits:
           nvidia.com/gpu: "8"

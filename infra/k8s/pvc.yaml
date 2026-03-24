@@ -5,8 +5,8 @@ metadata:
   namespace: arc-runners
 spec:
   accessModes:
-    - ReadWriteOnce
+    - ReadWriteMany
   resources:
     requests:
       storage: 1Ti  # models (Qwen3.5-35B ~70GB) + datasets
-  storageClassName: local
+  storageClassName: shared-wekafs

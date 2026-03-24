@@ -31,21 +31,6 @@ jobs:
 
 
     runs-on: limes-gpu-runners
-    container:
-      image: slimerl/slime:latest
-      options: >
-        --gpus all
-        --ipc=host
-        --shm-size=16g
-        --ulimit memlock=-1
-        --ulimit stack=67108864
-        --memory=0
-        --memory-swap=0
-        -e http_proxy=$http_proxy
-        -e https_proxy=$https_proxy
-        -e HTTP_PROXY=$HTTP_PROXY
-        -e HTTPS_PROXY=$HTTPS_PROXY
-        -v /root/models:/root/models
 
     strategy:
       fail-fast: false
@@ -91,21 +76,6 @@ jobs:
 
 
     runs-on: limes-gpu-runners
-    container:
-      image: slimerl/slime:latest
-      options: >
-        --gpus all
-        --ipc=host
-        --shm-size=16g
-        --ulimit memlock=-1
-        --ulimit stack=67108864
-        --memory=0
-        --memory-swap=0
-        -e http_proxy=$http_proxy
-        -e https_proxy=$https_proxy
-        -e HTTP_PROXY=$HTTP_PROXY
-        -e HTTPS_PROXY=$HTTPS_PROXY
-        -v /root/models:/root/models
 
     strategy:
       fail-fast: false
@@ -151,21 +121,6 @@ jobs:
 
 
     runs-on: limes-gpu-runners
-    container:
-      image: slimerl/slime:latest
-      options: >
-        --gpus all
-        --ipc=host
-        --shm-size=16g
-        --ulimit memlock=-1
-        --ulimit stack=67108864
-        --memory=0
-        --memory-swap=0
-        -e http_proxy=$http_proxy
-        -e https_proxy=$https_proxy
-        -e HTTP_PROXY=$HTTP_PROXY
-        -e HTTPS_PROXY=$HTTPS_PROXY
-        -v /root/models:/root/models
 
     strategy:
       fail-fast: false
@@ -211,21 +166,6 @@ jobs:
 
 
     runs-on: limes-gpu-runners
-    container:
-      image: slimerl/slime:latest
-      options: >
-        --gpus all
-        --ipc=host
-        --shm-size=16g
-        --ulimit memlock=-1
-        --ulimit stack=67108864
-        --memory=0
-        --memory-swap=0
-        -e http_proxy=$http_proxy
-        -e https_proxy=$https_proxy
-        -e HTTP_PROXY=$HTTP_PROXY
-        -e HTTPS_PROXY=$HTTPS_PROXY
-        -v /root/models:/root/models
 
     strategy:
       fail-fast: false
@@ -271,21 +211,6 @@ jobs:
 
 
     runs-on: limes-gpu-runners
-    container:
-      image: slimerl/slime:latest
-      options: >
-        --gpus all
-        --ipc=host
-        --shm-size=16g
-        --ulimit memlock=-1
-        --ulimit stack=67108864
-        --memory=0
-        --memory-swap=0
-        -e http_proxy=$http_proxy
-        -e https_proxy=$https_proxy
-        -e HTTP_PROXY=$HTTP_PROXY
-        -e HTTPS_PROXY=$HTTPS_PROXY
-        -v /root/models:/root/models
 
     strategy:
       fail-fast: false
@@ -388,21 +313,6 @@ jobs:
 
 
     runs-on: limes-gpu-runners
-    container:
-      image: slimerl/slime-test:latest
-      options: >
-        --gpus all
-        --ipc=host
-        --shm-size=16g
-        --ulimit memlock=-1
-        --ulimit stack=67108864
-        --memory=0
-        --memory-swap=0
-        -e http_proxy=$http_proxy
-        -e https_proxy=$https_proxy
-        -e HTTP_PROXY=$HTTP_PROXY
-        -e HTTPS_PROXY=$HTTPS_PROXY
-        -v /root/models:/root/models
 
     strategy:
       fail-fast: false
@@ -446,16 +356,6 @@ jobs:
   e2e-test-changed-detect:
     if: (github.event_name == 'workflow_dispatch') || (github.event.pull_request && contains(github.event.pull_request.labels.*.name, 'run-ci-changed'))
     runs-on: limes-gpu-runners
-    container:
-      image: slimerl/slime:latest
-      options: >
-        --gpus all
-        --ipc=host
-        --shm-size=16g
-        --ulimit memlock=-1
-        --ulimit stack=67108864
-        --memory=0
-        --memory-swap=0
     outputs:
       matrix: ${{ steps.detect.outputs.matrix }}
       has_tests: ${{ steps.detect.outputs.has_tests }}
@@ -496,21 +396,6 @@ jobs:
     needs: e2e-test-changed-detect
     if: needs.e2e-test-changed-detect.outputs.has_tests == 'true'
     runs-on: limes-gpu-runners
-    container:
-      image: slimerl/slime:latest
-      options: >
-        --gpus all
-        --ipc=host
-        --shm-size=16g
-        --ulimit memlock=-1
-        --ulimit stack=67108864
-        --memory=0
-        --memory-swap=0
-        -e http_proxy=$http_proxy
-        -e https_proxy=$https_proxy
-        -e HTTP_PROXY=$HTTP_PROXY
-        -e HTTPS_PROXY=$HTTPS_PROXY
-        -v /root/models:/root/models
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.e2e-test-changed-detect.outputs.matrix) }}
