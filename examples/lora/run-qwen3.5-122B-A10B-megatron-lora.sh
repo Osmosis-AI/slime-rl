@@ -125,6 +125,9 @@ PERF_ARGS=(
    # Packing is not supported for GDN currently
    --qkv-format bshd
    --micro-batch-size 1
+
+   # Chunk logits.clone() to avoid 5.68 GiB OOM at 12K seq_len (248K vocab)
+   --log-probs-chunk-size 4096
 )
 
 GRPO_ARGS=(
