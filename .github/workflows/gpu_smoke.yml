@@ -150,7 +150,9 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          docker run --rm --gpus all \
+          docker run --rm \
+            --runtime=nvidia \ 
+            -e NVIDIA_VISIBLE_DEVICES=all \
             --ipc=host \
             --shm-size=16g \
             --ulimit memlock=-1 \
