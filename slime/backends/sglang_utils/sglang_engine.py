@@ -196,10 +196,8 @@ class SGLangEngine(RayActor):
             return
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
-            if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
-                assert (
-                    self.worker_type == "regular"
-                ), "pd disaggregation is not supported in old router or slime router."
+            if not self.args.use_slime_router and parse(sglang_router.__version__) <= parse("0.2.1"):
+                assert self.worker_type == "regular", "pd disaggregation is not supported in old router."
                 response = requests.post(
                     f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
                 )
@@ -318,7 +316,7 @@ class SGLangEngine(RayActor):
         if self.worker_type != "encoder" and self.node_rank == 0:
             worker_url = f"http://{self.server_host}:{self.server_port}"
             response = None
-            if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
+            if self.args.use_slime_router or parse(sglang_router.__version__) <= parse("0.2.1"):
                 response = requests.post(
                     f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}"
                 )
@@ -572,11 +570,14 @@ def _compute_server_args(
         "skip_server_warmup": True,
         # always enable draft weights cpu backup so that we run training without mtp weights.
         "enable_draft_weights_cpu_backup": True,
+        # Always enable Prometheus metrics so the /engine_metrics endpoint is
+        # available for W&B scraping (regardless of --sglang-enable-metrics).
+        "enable_metrics": True,
     }
 
     if worker_type == "prefill":
         kwargs["disaggregation_mode"] = "prefill"
-        kwargs["load_balance_method"] = "round_robin"
+        kwargs["load_balance_method"] = "follow_bootstrap_room"
         assert (
             disaggregation_bootstrap_port is not None
         ), "disaggregation_bootstrap_port must be set for prefill worker"
@@ -652,5 +653,6 @@ _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS = [
     "dist_init_addr",
     "skip_server_warmup",
     "enable_draft_weights_cpu_backup",
+    "enable_metrics",
     "mem_fraction_static",
 ]
