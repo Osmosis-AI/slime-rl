@@ -14,9 +14,6 @@ NUM_GPUS = 8
 
 
 def prepare():
-    U.exec_command("pip install -U transformers huggingface_hub 2>&1 | tail -3")
-    U.exec_command("pip install git+https://github.com/coding-famer/Megatron-Bridge-slime.git@qwen35 --no-build-isolation 2>&1 | tail -3")
-    U.exec_command("pip install nvidia-cudnn-cu12==9.16.0.29 2>&1 | tail -3")
     U.exec_command("mkdir -p /root/models /root/datasets")
     U.exec_command(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     if USE_FP8_ROLLOUT:
