@@ -8,10 +8,8 @@ TIGHT_HOST_MEMORY = bool(int(os.environ.get("SLIME_TEST_TIGHT_HOST_MEMORY", "1")
 USE_DEEPEP = bool(int(os.environ.get("SLIME_TEST_USE_DEEPEP", "0")))
 USE_FP8_ROLLOUT = bool(int(os.environ.get("SLIME_TEST_USE_FP8_ROLLOUT", "0")))
 
-# MODEL_NAME = "Qwen3.5-35B-A3B"
-# MODEL_TYPE = "qwen3.5-35B-A3B"
-MODEL_NAME = "Qwen3.5-4B"
-MODEL_TYPE = "qwen3.5-4B"
+MODEL_NAME = "Qwen3.5-35B-A3B"
+MODEL_TYPE = "qwen3.5-35B-A3B"
 NUM_GPUS = 8
 
 
@@ -20,19 +18,22 @@ def prepare():
     U.exec_command(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     if USE_FP8_ROLLOUT:
         U.exec_command(f"hf download Qwen/{MODEL_NAME}-FP8 --local-dir /root/models/{MODEL_NAME}-FP8")
-    U.hf_download_dataset("zhuzilin/gsm8k")
+    U.hf_download_dataset("zhuzilin/gsm8k
+
+    U.convert_checkpoint(model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=NUM_GPUS)
+    
 
 
 def execute():
     if USE_FP8_ROLLOUT:
         ckpt_args = (
             f"--hf-checkpoint /root/models/{MODEL_NAME}-FP8 "
-            "--megatron-to-hf-mode bridge "
+            f"--ref-load /root/{MODEL_NAME}_torch_dist "
         )
     else:
         ckpt_args = (
             f"--hf-checkpoint /root/models/{MODEL_NAME} "
-            "--megatron-to-hf-mode bridge "
+            f"--ref-load /root/{MODEL_NAME}_torch_dist "
         )
 
     rollout_args = (
