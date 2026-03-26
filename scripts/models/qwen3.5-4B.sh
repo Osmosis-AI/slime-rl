@@ -20,6 +20,7 @@ MODEL_ARGS=(
    --vocab-size 248320
 
    --rotary-base 10000000
+   --untie-embeddings-and-output-weights
 
    # qwen3.5 specific
    --attention-output-gate
