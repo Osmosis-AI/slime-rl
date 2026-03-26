@@ -3,10 +3,8 @@ import os
 import slime.utils.external_utils.command_utils as U
 
 
-ENABLE_EVAL = bool(int(os.environ.get("SLIME_TEST_ENABLE_EVAL", "0")))
-
-MODEL_NAME = "Qwen3.5-4B"
-MODEL_TYPE = "qwen3.5-4B"
+MODEL_NAME = "Qwen3.5-35B-A3B"
+MODEL_TYPE = "qwen3.5-35B-A3B"
 NUM_GPUS = 8
 
 
@@ -22,6 +20,13 @@ def execute():
         "--megatron-to-hf-mode bridge "
     )
 
+    lora_args = (
+        "--lora-rank 32 "
+        "--lora-alpha 32 "
+        "--lora-dropout 0.0 "
+        "--target-modules all-linear "
+    )
+
     rollout_args = (
         "--prompt-data /root/datasets/gsm8k/train.parquet "
         "--input-key messages "
@@ -30,19 +35,18 @@ def execute():
         "--rollout-shuffle "
         "--rm-type math "
         "--num-rollout 1 "
-        "--rollout-batch-size 4 "
-        "--n-samples-per-prompt 2 "
-        "--rollout-max-response-len 512 "
-        "--rollout-temperature 0.8 "
-        "--global-batch-size 8 "
-        "--balance-data "
+        "--rollout-batch-size 16 "
+        "--n-samples-per-prompt 8 "
+        "--rollout-max-response-len 1024 "
+        "--rollout-temperature 1 "
+        "--global-batch-size 128 "
     )
 
     eval_args = (
-        f"{'--eval-interval 20 ' if ENABLE_EVAL else ''}"
+        "--eval-interval 25 "
         "--eval-prompt-data gsm8k /root/datasets/gsm8k/test.parquet "
         "--n-samples-per-eval-prompt 1 "
-        "--eval-max-response-len 512 "
+        "--eval-max-response-len 1024 "
         "--eval-top-k 1 "
     )
 
@@ -51,15 +55,20 @@ def execute():
         "--sequence-parallel "
         "--pipeline-model-parallel-size 1 "
         "--context-parallel-size 1 "
+        "--expert-model-parallel-size 8 "
+        "--expert-tensor-parallel-size 1 "
         "--recompute-granularity full "
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
-        "--use-dynamic-batch-size "
-        "--max-tokens-per-gpu 2048 "
+        "--qkv-format bshd "
+        "--micro-batch-size 1 "
     )
 
     grpo_args = (
         "--advantage-estimator grpo "
+        "--kl-loss-coef 0.01 "
+        "--kl-loss-type low_var_kl "
+        "--kl-coef 0.00 "
         "--entropy-coef 0.00 "
         "--eps-clip 0.2 "
         "--eps-clip-high 0.28 "
@@ -67,22 +76,25 @@ def execute():
 
     optimizer_args = (
         "--optimizer adam "
-        "--lr 1e-6 "
+        "--lr 5e-5 "
+        "--clip-grad 1.0 "
         "--lr-decay-style constant "
         "--weight-decay 0.1 "
         "--adam-beta1 0.9 "
         "--adam-beta2 0.98 "
+        "--optimizer-cpu-offload "
+        "--overlap-cpu-optimizer-d2h-h2d "
+        "--use-precision-aware-optimizer "
     )
 
     sglang_args = (
         "--rollout-num-gpus-per-engine 8 "
-        "--sglang-mem-fraction-static 0.5 "
-        "--sglang-cuda-graph-max-bs 32 "
+        "--sglang-mem-fraction-static 0.7 "
+        "--sglang-ep-size 8 "
+        "--sglang-cuda-graph-bs 1 2 4 8 16 24 32 40 48 56 64 72 80 88 96 104 112 120 128 136 144 152 160 168 176 184 192 200 208 216 224 232 240 248 256 "
         "--sglang-max-running-requests 512 "
-        "--sglang-enable-metrics "
+        "--offload-train "
     )
-
-    ci_args = "--ci-test "
 
     misc_args = (
         "--attention-dropout 0.0 "
@@ -93,10 +105,14 @@ def execute():
         "--actor-num-nodes 1 "
         "--actor-num-gpus-per-node 8 "
         "--colocate "
+        "--calculate-per-token-loss "
+        "--use-slime-router "
+        "--moe-token-dispatcher-type alltoall "
     )
 
     train_args = (
         f"{ckpt_args} "
+        f"{lora_args} "
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
@@ -104,7 +120,6 @@ def execute():
         f"{perf_args} "
         f"{eval_args} "
         f"{sglang_args} "
-        f"{ci_args} "
         f"{misc_args} "
     )
 
