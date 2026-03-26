@@ -1027,12 +1027,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to use SlimeRouter for text-based routing instead of SGLang token-based routing",
             )
             parser.add_argument(
-                "--slime-router-middleware-paths",
-                type=str,
-                nargs="+",
-                default="",
-            )
-            parser.add_argument(
                 "--slime-router-timeout",
                 type=float,
                 default=None,
@@ -1319,7 +1313,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--loss-mask-type",
                 type=str,
                 default="qwen",
-                choices=["qwen", "qwen3", "distill_qwen"],
+                choices=["qwen", "qwen3", "qwen3_5", "distill_qwen"],
                 help="Loss mask type",
             )
             parser.add_argument(
