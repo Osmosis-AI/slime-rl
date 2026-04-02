@@ -183,6 +183,8 @@ class UpdateWeightFromTensor:
             _check_weight_sync_results(results, is_lora=self.is_lora)
             all_long_lived_tensors.append(long_lived_tensors)
             sync_chunk_count += 1
+            del hf_named_tensors
+            torch.cuda.ipc_collect()
 
         if self.is_lora and sync_chunk_count == 0:
             raise RuntimeError(
@@ -192,6 +194,9 @@ class UpdateWeightFromTensor:
             )
 
         dist.barrier(group=get_gloo_group())
+        # After the barrier all engines have returned, so every rank's last-chunk
+        # IPC handles are now released by the consumers.  Clean them up.
+        torch.cuda.ipc_collect()
 
         # int4/fp4 post_process
         if rank == 0:

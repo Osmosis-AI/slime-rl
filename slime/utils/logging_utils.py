@@ -1,5 +1,6 @@
 import logging
 
+from . import wandb_utils
 from .tracking import TrackingManager
 
 _LOGGER_CONFIGURED = False
@@ -24,6 +25,12 @@ def configure_logger(prefix: str = ""):
 
 def init_tracking(args, primary: bool = True, **kwargs):
     _manager.init(args, primary=primary, **kwargs)
+
+
+def update_tracking_open_metrics(args, router_addr):
+    if not getattr(args, "use_wandb", False):
+        return
+    wandb_utils.reinit_wandb_primary_with_open_metrics(args, router_addr)
 
 
 def log(args, metrics, step_key: str):

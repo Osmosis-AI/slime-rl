@@ -819,7 +819,4 @@ def initialize_model_and_optimizer(
         }
         logging_utils.log(args, param_log, step_key="train/step")
         logging_utils.log_model_params(total, trainable)
-
-    opt_param_scheduler.step(increment=iteration * args.global_batch_size)
-
     return model, optimizer, opt_param_scheduler, iteration
