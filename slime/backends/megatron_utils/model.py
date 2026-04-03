@@ -805,6 +805,7 @@ def initialize_model_and_optimizer(
     )
     clear_memory()
 
+<<<<<<< HEAD
     if (mpu.get_data_parallel_rank(with_context_parallel=True) == 0
             and mpu.get_tensor_model_parallel_rank() == 0
             and mpu.is_pipeline_last_stage()):
@@ -822,4 +823,6 @@ def initialize_model_and_optimizer(
 
     opt_param_scheduler.step(increment=iteration * args.global_batch_size)
 
+=======
+>>>>>>> upstream/main
     return model, optimizer, opt_param_scheduler, iteration
