@@ -739,6 +739,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
 
     try:
         from megatron.bridge import AutoBridge
+
         from slime.utils.megatron_bridge_utils import patch_megatron_model
 
         path = Path(args.save_hf.format(rollout_id=rollout_id))
@@ -788,6 +789,7 @@ def initialize_model_and_optimizer(
 
     if torch.version.hip:
         import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
+
         from slime.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync
 
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
@@ -805,6 +807,7 @@ def initialize_model_and_optimizer(
     )
     clear_memory()
 
+<<<<<<< HEAD
     if (mpu.get_data_parallel_rank(with_context_parallel=True) == 0
             and mpu.get_tensor_model_parallel_rank() == 0
             and mpu.is_pipeline_last_stage()):
@@ -822,4 +825,6 @@ def initialize_model_and_optimizer(
 
     opt_param_scheduler.step(increment=iteration * args.global_batch_size)
 
+=======
+>>>>>>> upstream/main
     return model, optimizer, opt_param_scheduler, iteration
