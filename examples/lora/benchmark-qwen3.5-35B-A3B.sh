@@ -36,7 +36,6 @@ SHARED_ARGS=(
    --actor-num-gpus-per-node $GPUS_PER_NODE
    --colocate
    --calculate-per-token-loss
-   --use-slime-router
 
    --hf-checkpoint /root/Qwen3.5-35B-A3B/
    --megatron-to-hf-mode bridge

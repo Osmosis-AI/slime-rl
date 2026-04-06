@@ -1030,31 +1030,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--use-slime-router",
                 action="store_true",
                 default=False,
-                help="Whether to use SlimeRouter for text-based routing instead of SGLang token-based routing",
+                help="Deprecated. Ignored. slime now always uses sglang_router.",
             )
             parser.add_argument(
                 "--slime-router-middleware-paths",
                 type=str,
                 nargs="+",
                 default="",
-            )
-            parser.add_argument(
-                "--slime-router-timeout",
-                type=float,
-                default=None,
-                help="Timeout for SlimeRouter HTTP requests in seconds.",
-            )
-            parser.add_argument(
-                "--slime-router-max-connections",
-                type=int,
-                default=None,
-                help="Max connections for SlimeRouter HTTP client.",
-            )
-            parser.add_argument(
-                "--slime-router-health-check-failure-threshold",
-                type=int,
-                default=3,
-                help="Number of consecutive failures before marking a worker as unhealthy.",
             )
             RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
             return parser
@@ -1571,6 +1553,13 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    if args.use_slime_router:
+        logger.warning(
+            "--use-slime-router is deprecated and ignored. slime now always uses sglang_router "
+            "built from https://github.com/zhuzilin/sgl-router."
+        )
+        args.use_slime_router = False
 
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):

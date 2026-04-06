@@ -194,7 +194,6 @@ ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
    --actor-num-gpus-per-node $GPUS_PER_NODE \
    --colocate \
    --calculate-per-token-loss \
-   --use-slime-router \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${LORA_ARGS[@]} \
