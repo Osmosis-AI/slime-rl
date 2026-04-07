@@ -1630,6 +1630,12 @@ def slime_validate_args(args):
                 args.ckpt_step = args.ref_ckpt_step
             args.start_rollout_id = 0
 
+    if getattr(args, "fp8_param_gather", False) and getattr(args, "optimizer_cpu_offload", False):
+        raise ValueError(
+            "--fp8-param-gather is incompatible with --optimizer-cpu-offload. "
+            "FP8 param gather requires GPU-resident optimizer states."
+        )
+
     if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
 

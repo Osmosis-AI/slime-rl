@@ -1,9 +1,10 @@
 #!/bin/bash
-# Qwen3.5-122B-A10B LoRA GRPO on 8xH200 (single node)
+# Qwen3.5-122B-A10B FP8 LoRA GRPO on 8xH200 (single node)
+# BF16 checkpoint + TransformerEngine FP8 training (e4m3 blockwise) + LoRA rank=64.
 # Works on both k8s pods (Together AI) and standalone (EC2/Docker)
 #
-# K8s pod:  MODEL_DIR=/osmosis/models/Qwen/Qwen3.5-122B-A10B bash examples/lora/run-qwen3.5-122B-A10B-megatron-lora.sh
-# EC2:      bash examples/lora/run-qwen3.5-122B-A10B-megatron-lora.sh
+# K8s pod:  MODEL_DIR=/osmosis/models/Qwen/Qwen3.5-122B-A10B bash examples/lora/run-qwen3.5-122B-A10B-megatron-lora-fp8.sh
+# EC2:      bash examples/lora/run-qwen3.5-122B-A10B-megatron-lora-fp8.sh
 
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export GPUS_PER_NODE=8
@@ -128,6 +129,14 @@ PERF_ARGS=(
 
    # Chunk logits.clone() to avoid 5.68 GiB OOM at 12K seq_len (248K vocab)
    --log-probs-chunk-size 4096
+
+   # FP8 training via TransformerEngine
+   --transformer-impl transformer_engine
+   --bf16
+   --fp8-format e4m3
+   --fp8-recipe blockwise
+   # --fp8-param-gather  # Keeps weights in FP8 during allgather (halves TP comm)
+   #                     # Incompatible with --optimizer-cpu-offload
 )
 
 GRPO_ARGS=(
@@ -157,7 +166,7 @@ OPTIMIZER_ARGS=(
 MLFLOW_ARGS=(
    --use-mlflow
    --mlflow-experiment-name slime-lora-megatron
-   --mlflow-run-name qwen3.5-122B-A10B-dapo-lora
+   --mlflow-run-name qwen3.5-122B-A10B-dapo-lora-fp8
 )
 
 SGLANG_ARGS=(
@@ -196,6 +205,7 @@ RUNTIME_ENV_JSON="{
     \"PYTHONPATH\": \"${MEGATRON_LM_DIR}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"NVTE_FP8_BLOCK_SCALING_FP32_SCALES\": \"1\",
     \"SGLANG_DISABLE_CUDNN_CHECK\": \"1\",
     \"no_proxy\": \"${no_proxy}\"
   }
