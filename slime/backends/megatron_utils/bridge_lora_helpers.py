@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from megatron.core.utils import get_attr_wrapped_model
 
+from .kernels.fused_moe_integration import patch_model_for_fused_moe
 from .lora_utils import create_lora_instance
 from .model_provider import _propagate_fp8_config
 
@@ -263,6 +264,20 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
         return transformed
 
     provider.register_pre_wrap_hook(apply_lora_hook)
+
+    if getattr(args, "use_fused_moe_backward", False):
+
+        def apply_fused_moe_hook(model_chunks):
+            transformed = _ensure_model_list(model_chunks)
+            patched = patch_model_for_fused_moe(transformed)
+            if patched == 0:
+                raise RuntimeError(
+                    "Requested --use-fused-moe-backward, but no grouped expert modules were patched."
+                )
+            logger.info("Enabled fused MoE backward on %s grouped expert module(s).", patched)
+            return model_chunks
+
+        provider.register_pre_wrap_hook(apply_fused_moe_hook)
 
     is_value_model = (
         "ForTokenClassification" in hf_config.architectures[0]

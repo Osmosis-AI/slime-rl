@@ -1,0 +1,57 @@
+resources:
+  image_id: osmosisdocker/limes:latest
+  accelerators: H200:8
+  cloud: kubernetes
+
+config:
+  kubernetes:
+    provision_timeout: 1800
+    pod_config:
+      spec:
+        priorityClassName: skypilot-high-priority
+
+setup: |
+  set -eux
+  cd /root
+  if [ ! -d slime ]; then
+    git clone https://github.com/mouad-hpc/slime.git
+  fi
+  cd slime
+  git fetch origin
+  git checkout mouad/fused-kernels
+  git pull origin mouad/fused-kernels
+  pip install -e . 2>/dev/null || true
+  export PYTHONPATH=/root/Megatron-LM:${PYTHONPATH:-}
+
+run: |
+  set -eux
+  cd /root/slime
+  export PYTHONPATH=/root/Megatron-LM:${PYTHONPATH:-}
+
+  echo "=== Step 1: py_compile ==="
+  python3 -m py_compile slime/backends/megatron_utils/kernels/fused_experts.py && echo "fused_experts.py OK"
+  python3 -m py_compile slime/backends/megatron_utils/kernels/fused_moe_triton_backward_kernels.py && echo "backward_kernels.py OK"
+  python3 -m py_compile slime/backends/megatron_utils/kernels/fused_moe_integration.py && echo "integration.py OK"
+  python3 -m py_compile tests/test_fused_moe_integration.py && echo "test.py OK"
+  python3 -m py_compile tools/benchmark_fused_moe.py && echo "benchmark.py OK"
+
+  echo ""
+  echo "=== Step 2: Unit tests ==="
+  python3 -m pytest tests/test_fused_moe_integration.py -q || true
+
+  echo ""
+  echo "=== Step 3: GPU parity check (small) ==="
+  python3 tools/benchmark_fused_moe.py --mode parity --num-tokens 128 --hidden-size 2048 --ffn-hidden-size 512 --num-experts 256 --topk 8
+
+  echo ""
+  echo "=== Step 4: GPU microbenchmark (small) ==="
+  python3 tools/benchmark_fused_moe.py --mode micro --num-tokens 256 --hidden-size 2048 --ffn-hidden-size 512 --num-experts 256 --topk 8
+
+  echo ""
+  echo "=== Step 5: Production shapes (Qwen3.5-35B-A3B) ==="
+  python3 tools/benchmark_fused_moe.py --mode parity --num-tokens 4096 --hidden-size 2048 --ffn-hidden-size 512 --num-experts 64 --topk 8
+  python3 tools/benchmark_fused_moe.py --mode micro --num-tokens 4096 --hidden-size 2048 --ffn-hidden-size 512 --num-experts 64 --topk 8
+
+  echo ""
+  echo "=== DONE — pod staying alive for SSH ==="
+  sleep infinity
