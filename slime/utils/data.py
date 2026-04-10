@@ -127,7 +127,9 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
     return filtered_samples
 
 
-def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimodal_keys: dict = None):
+def _build_messages(
+    data: dict, prompt_key: str, as_conversation: bool, multimodal_keys: dict = None, system_prompt: str = None
+):
     prompt = data.get(prompt_key)
 
     if isinstance(prompt, str):
@@ -136,6 +138,9 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
             return prompt
         else:
             prompt = [{"role": "user", "content": prompt}]
+
+    if system_prompt and isinstance(prompt, list) and (not prompt or prompt[0].get("role") != "system"):
+        prompt = [{"role": "system", "content": system_prompt}] + prompt
 
     if multimodal_keys:
         # Build mapping: placeholder -> (MultimodalType, content_list)
@@ -208,12 +213,13 @@ class Dataset:
         seed=42,
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
+        system_prompt=None,
     ):
         origin_samples = []
         for data in read_file(path):
             # Both chat templates and multimodal inputs require conversation format (list of message dicts)
             as_conversation = apply_chat_template or (multimodal_keys is not None)
-            prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
+            prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys, system_prompt=system_prompt)
 
             metadata = data.get(metadata_key) or {}
             tools = None

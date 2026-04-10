@@ -19,6 +19,45 @@ from megatron.training.arguments import core_transformer_config_from_args
 
 from slime.utils.misc import load_function
 
+# FP8 attributes to propagate from Megatron args to a Bridge provider.
+# The non-Bridge path gets these automatically via core_transformer_config_from_args();
+# the Bridge path bypasses that, so we must set them explicitly.
+_FP8_PROVIDER_ATTRS = [
+    "fp8",
+    "fp8_recipe",
+    "fp8_margin",
+    "fp8_interval",
+    "fp8_amax_history_len",
+    "fp8_amax_compute_algo",
+    "fp8_wgrad",
+    "fp8_dot_product_attention",
+    "fp8_multi_head_attention",
+    "fp8_param_gather",
+]
+
+
+def _propagate_fp8_config(provider, args):
+    """Propagate FP8 config from Megatron args to a Bridge provider.
+
+    Called before ``provider.finalize()`` in both the LoRA and non-LoRA
+    Bridge code paths so that all FP8 knobs reach the TransformerConfig.
+    """
+    if not getattr(args, "fp8", None):
+        return
+    for attr in _FP8_PROVIDER_ATTRS:
+        val = getattr(args, attr, None)
+        if val is not None:
+            try:
+                setattr(provider, attr, val)
+            except AttributeError:
+                pass
+    # MoE: pad router token counts to multiples of 16 for FP8 GEMMs
+    if getattr(args, "num_experts", None):
+        try:
+            provider.moe_router_padding_for_fp8 = True
+        except AttributeError:
+            pass
+
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
 class LinearForLastLayer(torch.nn.Linear):
@@ -106,6 +145,7 @@ def get_model_provider_func(
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
         if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
             provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
+        _propagate_fp8_config(provider, args)
         provider.finalize()
 
         def wrapped_bridge_provider(

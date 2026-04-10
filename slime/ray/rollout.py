@@ -469,7 +469,7 @@ class RolloutManager:
         # Pause health checks before returning to training loop — workers may become
         # temporarily unresponsive during training (GPU memory pressure) or weight updates.
         self.health_monitoring_pause()
-        self._router_pause_health_checks()
+
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:
@@ -487,7 +487,7 @@ class RolloutManager:
         result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
         # Pause health checks before returning to training loop
         self.health_monitoring_pause()
-        self._router_pause_health_checks()
+
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
@@ -500,7 +500,7 @@ class RolloutManager:
 
     def offload(self):
         self.health_monitoring_pause()
-        self._router_pause_health_checks()
+
         for srv in self.servers.values():
             srv.offload()
 
@@ -523,7 +523,7 @@ class RolloutManager:
         updates from training).
         """
         self.health_monitoring_pause()
-        self._router_pause_health_checks()
+
         srv = self._get_updatable_server()
         if self.rollout_id == -1 or srv is None:
             engines = srv.engines if srv else []
@@ -553,19 +553,6 @@ class RolloutManager:
     def health_monitoring_resume(self) -> None:
         for monitor in self._health_monitors:
             monitor.resume()
-
-    def _router_pause_health_checks(self) -> None:
-        """Notify slime routers to pause health checks during memory offload."""
-        if not getattr(self.args, "use_slime_router", False):
-            return
-        for srv in self.servers.values():
-            if srv.router_ip and srv.router_port:
-                url = f"http://{srv.router_ip}:{srv.router_port}/pause_health_checks"
-                try:
-                    resp = _requests.post(url, json={}, timeout=5)
-                    logger.info(f"Router pause_health_checks {url} -> {resp.status_code}")
-                except Exception as e:
-                    logger.warning(f"Failed to pause router health checks at {url}: {e}")
 
     def check_weights(self, action: str):
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
@@ -911,7 +898,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 
 
 def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool = False) -> tuple[str, int]:
-    """Start sgl router or slime router and return (router_ip, router_port).
+    """Start sglang_router and return (router_ip, router_port).
 
     If ``args.sglang_router_ip`` is already set (e.g. by the user) and
     ``force_new`` is False, skip launching and return the existing values.
@@ -928,32 +915,21 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
         if router_port is None:
             router_port = find_available_port(random.randint(3000, 4000))
 
-    if args.use_slime_router:
-        assert not has_pd_disaggregation, "slime router does not support PD disaggregation."
-        import copy
+    from sglang_router.launch_router import RouterArgs
 
-        from slime.router.router import run_router
+    from slime.utils.http_utils import run_router
 
-        router_args = copy.copy(args)
-        router_args.sglang_router_ip = router_ip
-        router_args.sglang_router_port = router_port
+    router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
+    router_args.host = router_ip
+    router_args.port = router_port
+    router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
+    router_args.log_level = "warn"
+    router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
 
-    else:
-        from sglang_router.launch_router import RouterArgs
+    if has_pd_disaggregation:
+        router_args.pd_disaggregation = True
 
-        from slime.utils.http_utils import run_router
-
-        router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
-        router_args.host = router_ip
-        router_args.port = router_port
-        router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
-        router_args.log_level = "warn"
-        router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
-
-        if has_pd_disaggregation:
-            router_args.pd_disaggregation = True
-
-        logger.info(f"Launch router with args: {router_args}")
+    logger.info(f"Launch router with args: {router_args}")
 
     process = multiprocessing.Process(
         target=run_router,

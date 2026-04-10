@@ -35,7 +35,6 @@ RUN git clone https://github.com/Dao-AILab/flash-attention.git && \
 
 RUN pip install git+https://github.com/ISEEKYAN/mbridge.git@ed7d432112f29cd695f6620972bb375602d91407 --no-deps
 
-RUN pip install flash-linear-attention==0.4.1
 RUN pip install tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
 
 # TE does not have wheel on cuda 13 yet, thus need to install from source
@@ -61,7 +60,7 @@ RUN pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@1bc80bb0d6
 # Megatron-Bridge: Osmosis-AI fork (MLAModelProvider stub baked into main branch)
 RUN pip install git+https://github.com/Osmosis-AI/Megatron-Bridge.git@main --no-deps --no-build-isolation
 
-RUN pip install nvidia-modelopt[torch]>=0.42.0 --no-build-isolation
+RUN pip install nvidia-modelopt[torch]==0.42.0 --no-build-isolation
 
 # This patch from masahi will be included in later Triton releases
 RUN if [ "$ENABLE_CUDA_13" = "1" ]; then \
@@ -70,9 +69,6 @@ RUN if [ "$ENABLE_CUDA_13" = "1" ]; then \
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt
-
-# Qwen3.5 requires native config support (qwen3_5_moe model type)
-RUN pip install "transformers>=5.3.0"
 
 # MLflow for experiment tracking (--ignore-installed blinker for debian conflict)
 RUN pip install mlflow --ignore-installed blinker
@@ -89,6 +85,9 @@ RUN pip install nvidia-cudnn-cu12==9.16.0.29
 
 # reinstall numpy 1.x for megatron
 RUN pip install "numpy<2"
+
+RUN pip install https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-5f8d397/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl --force-reinstall
+RUN python -c "import sglang_router; assert 'slime' in sglang_router.__version__"
 
 RUN rm -rf /root/.cache/pip /root/flash-attention
 

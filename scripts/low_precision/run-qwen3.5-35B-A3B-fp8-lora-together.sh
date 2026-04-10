@@ -1,34 +1,35 @@
 #!/bin/bash
-# Qwen3.5-122B-A10B LoRA GRPO on 8xH200 (single node)
-# Works on both k8s pods (Together AI) and standalone (EC2/Docker)
+# Qwen3.5-35B-A3B FP8 LoRA GRPO training — Together AI cluster (8xH200).
+# BF16 checkpoint + TransformerEngine FP8 training (e4m3 blockwise) + LoRA rank=32.
+# TP=2, EP=8, CPU optimizer offload, offload-train for colocated LoRA.
 #
-# K8s pod:  MODEL_DIR=/osmosis/models/Qwen/Qwen3.5-122B-A10B bash examples/lora/run-qwen3.5-122B-A10B-megatron-lora.sh
-# EC2:      bash examples/lora/run-qwen3.5-122B-A10B-megatron-lora.sh
+# Together AI pod:  kubectl exec -it mouad-qwen122b -n trainers -- bash
+#   MODEL_DIR=/root/Qwen3.5-35B-A3B bash scripts/low_precision/run-qwen3.5-35B-A3B-fp8-lora-together.sh
 
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export GPUS_PER_NODE=8
 export PYTHONBUFFERED=16
 
-# ── Configurable paths (override via env vars for k8s) ──────────────────
-MODEL_DIR=${MODEL_DIR:-/root/Qwen3.5-122B-A10B}
+# ── Configurable paths (override via env vars) ────────────────────────
+MODEL_DIR=${MODEL_DIR:-/root/Qwen3.5-35B-A3B}
 TRAIN_DATA=${TRAIN_DATA:-/root/datasets/dapo-math-17k/dapo-math-17k.jsonl}
 EVAL_DATA=${EVAL_DATA:-/root/datasets/aime-2024/aime-2024.jsonl}
 MEGATRON_LM_DIR=${MEGATRON_LM_DIR:-/root/Megatron-LM}
-CHECKPOINT_DIR=${CHECKPOINT_DIR:-/osmosis/checkpoints}
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-/root/checkpoints/qwen3.5-35B-A3B-fp8-lora}
 RAY_PORT=${RAY_PORT:-6381}
 RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8266}
 
-# ── Download model if not present ────────────────────────────────────────
+# ── Download model if not present ─────────────────────────────────────
 if [ ! -d "${MODEL_DIR}" ] || [ -z "$(ls -A ${MODEL_DIR} 2>/dev/null)" ]; then
-    echo "Downloading Qwen/Qwen3.5-122B-A10B to ${MODEL_DIR}..."
+    echo "Downloading Qwen/Qwen3.5-35B-A3B to ${MODEL_DIR}..."
     python3 -c "
 from huggingface_hub import snapshot_download
-snapshot_download('Qwen/Qwen3.5-122B-A10B', local_dir='${MODEL_DIR}')
+snapshot_download('Qwen/Qwen3.5-35B-A3B', local_dir='${MODEL_DIR}')
 print('Model download complete.')
 "
 fi
 
-# ── Download datasets if not present ─────────────────────────────────────
+# ── Download datasets if not present ──────────────────────────────────
 if [ ! -f "${TRAIN_DATA}" ]; then
     TRAIN_DIR=$(dirname "${TRAIN_DATA}")
     echo "Downloading dapo-math-17k to ${TRAIN_DIR}..."
@@ -49,7 +50,7 @@ print('Eval dataset download complete.')
 "
 fi
 
-# ── Clean up stale processes ─────────────────────────────────────────────
+# ── Clean up stale processes ──────────────────────────────────────────
 pkill -9 sglang 2>/dev/null || true
 sleep 3
 ray stop --force 2>/dev/null || true
@@ -67,18 +68,18 @@ else
 fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/../../scripts/models/qwen3.5-122B-A10B.sh"
+source "${SCRIPT_DIR}/../models/qwen3.5-35B-A3B.sh"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}
    --megatron-to-hf-mode bridge
    --save ${CHECKPOINT_DIR}
-   --save-interval 20
+   --save-interval 50
 )
 
 LORA_ARGS=(
-   --lora-rank 64
-   --lora-alpha 64
+   --lora-rank 32
+   --lora-alpha 32
    --lora-dropout 0.0
    --target-modules "all-linear"
    --megatron-to-hf-mode bridge
@@ -91,14 +92,14 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --rm-type deepscaler
-   --num-rollout 531
-   --rollout-batch-size 32
+   --num-rollout 200
+   --rollout-batch-size 16
    --n-samples-per-prompt 8
-   --rollout-max-response-len 16384
+   --rollout-max-response-len 12288
    --system-prompt "Think concisely and efficiently. Provide your reasoning, then put your final answer within \\boxed{}."
    --rollout-temperature 1
 
-   --global-batch-size 256
+   --global-batch-size 128
 )
 
 EVAL_ARGS=(
@@ -106,7 +107,7 @@ EVAL_ARGS=(
    --eval-prompt-data aime ${EVAL_DATA}
    --eval-input-key prompt
    --n-samples-per-eval-prompt 1
-   --eval-max-response-len 16384
+   --eval-max-response-len 4096
    --eval-top-k 1
 )
 
@@ -122,12 +123,15 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   # Packing is not supported for GDN currently
    --qkv-format bshd
    --micro-batch-size 1
 
-   # Chunk logits.clone() to avoid 5.68 GiB OOM at 12K seq_len (248K vocab)
-   --log-probs-chunk-size 4096
+   # FP8 training via TransformerEngine
+   --transformer-impl transformer_engine
+   --bf16
+   --fp8-format e4m3
+   --fp8-recipe blockwise
+   # --fp8-param-gather  # incompatible with CPU Adam
 )
 
 GRPO_ARGS=(
@@ -142,7 +146,7 @@ GRPO_ARGS=(
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 2e-5
+   --lr 5e-5
    --clip-grad 1.0
    --lr-decay-style constant
    --weight-decay 0.1
@@ -156,8 +160,8 @@ OPTIMIZER_ARGS=(
 
 MLFLOW_ARGS=(
    --use-mlflow
-   --mlflow-experiment-name slime-lora-megatron
-   --mlflow-run-name qwen3.5-122B-A10B-dapo-lora
+   --mlflow-experiment-name qwen3.5-35B-A3B-fp8-lora
+   --mlflow-run-name fp8-e4m3-lora-r32-together
 )
 
 SGLANG_ARGS=(
@@ -165,8 +169,7 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static 0.7
    --sglang-ep-size 8
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
-
-   --sglang-max-running-requests 128
+   --sglang-max-running-requests 512
    --offload-train
 )
 
@@ -179,7 +182,7 @@ MISC_ARGS=(
    --moe-token-dispatcher-type alltoall
 )
 
-# ── Ray setup (port 6381 to avoid SkyPilot conflict on k8s) ─────────────
+# ── Ray setup (port 6381 to avoid SkyPilot conflict on k8s) ──────────
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 export no_proxy="127.0.0.1,${MASTER_ADDR}"
 
@@ -196,6 +199,7 @@ RUNTIME_ENV_JSON="{
     \"PYTHONPATH\": \"${MEGATRON_LM_DIR}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"NVTE_FP8_BLOCK_SCALING_FP32_SCALES\": \"1\",
     \"SGLANG_DISABLE_CUDNN_CHECK\": \"1\",
     \"no_proxy\": \"${no_proxy}\"
   }

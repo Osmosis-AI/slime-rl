@@ -1,53 +1,28 @@
 #!/bin/bash
-# Qwen3.5-122B-A10B LoRA GRPO on 8xH200 (single node)
-# Works on both k8s pods (Together AI) and standalone (EC2/Docker)
+# Qwen3.5-122B-A10B LoRA GRPO on 2x8xH200 (multi-node)
+# Run on the HEAD node only. Worker must have Ray joined first.
 #
-# K8s pod:  MODEL_DIR=/osmosis/models/Qwen/Qwen3.5-122B-A10B bash examples/lora/run-qwen3.5-122B-A10B-megatron-lora.sh
-# EC2:      bash examples/lora/run-qwen3.5-122B-A10B-megatron-lora.sh
+# Setup:
+#   HEAD:   MASTER_ADDR=<head-ip> bash examples/lora/run-qwen3.5-122B-A10B-megatron-lora-2node.sh
+#   WORKER: ray start --address=<head-ip>:6381 --num-gpus 8
+#
+# K8s 2-pod setup:
+#   Pod 1 (head):   kubectl exec mouad-qwen122b -- env MASTER_ADDR=<pod1-ip> bash ...
+#   Pod 2 (worker): kubectl exec mouad-qwen122b-worker -- ray start --address=<pod1-ip>:6381 --num-gpus 8
 
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export GPUS_PER_NODE=8
 export PYTHONBUFFERED=16
+NUM_NODES=2
 
-# ── Configurable paths (override via env vars for k8s) ──────────────────
+# ── Configurable paths ──────────────────────────────────────────────────
 MODEL_DIR=${MODEL_DIR:-/root/Qwen3.5-122B-A10B}
 TRAIN_DATA=${TRAIN_DATA:-/root/datasets/dapo-math-17k/dapo-math-17k.jsonl}
 EVAL_DATA=${EVAL_DATA:-/root/datasets/aime-2024/aime-2024.jsonl}
 MEGATRON_LM_DIR=${MEGATRON_LM_DIR:-/root/Megatron-LM}
-CHECKPOINT_DIR=${CHECKPOINT_DIR:-/osmosis/checkpoints}
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-/root/checkpoints}
 RAY_PORT=${RAY_PORT:-6381}
 RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8266}
-
-# ── Download model if not present ────────────────────────────────────────
-if [ ! -d "${MODEL_DIR}" ] || [ -z "$(ls -A ${MODEL_DIR} 2>/dev/null)" ]; then
-    echo "Downloading Qwen/Qwen3.5-122B-A10B to ${MODEL_DIR}..."
-    python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download('Qwen/Qwen3.5-122B-A10B', local_dir='${MODEL_DIR}')
-print('Model download complete.')
-"
-fi
-
-# ── Download datasets if not present ─────────────────────────────────────
-if [ ! -f "${TRAIN_DATA}" ]; then
-    TRAIN_DIR=$(dirname "${TRAIN_DATA}")
-    echo "Downloading dapo-math-17k to ${TRAIN_DIR}..."
-    python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download('zhuzilin/dapo-math-17k', repo_type='dataset', local_dir='${TRAIN_DIR}')
-print('Train dataset download complete.')
-"
-fi
-
-if [ ! -f "${EVAL_DATA}" ]; then
-    EVAL_DIR=$(dirname "${EVAL_DATA}")
-    echo "Downloading aime-2024 to ${EVAL_DIR}..."
-    python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download('zhuzilin/aime-2024', repo_type='dataset', local_dir='${EVAL_DIR}')
-print('Eval dataset download complete.')
-"
-fi
 
 # ── Clean up stale processes ─────────────────────────────────────────────
 pkill -9 sglang 2>/dev/null || true
@@ -102,7 +77,7 @@ ROLLOUT_ARGS=(
 )
 
 EVAL_ARGS=(
-   --eval-interval 50
+   --eval-interval 20
    --eval-prompt-data aime ${EVAL_DATA}
    --eval-input-key prompt
    --n-samples-per-eval-prompt 1
@@ -115,18 +90,16 @@ PERF_ARGS=(
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
-   --expert-model-parallel-size 8
+   --expert-model-parallel-size 16
    --expert-tensor-parallel-size 1
 
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
 
-   # Packing is not supported for GDN currently
    --qkv-format bshd
    --micro-batch-size 1
 
-   # Chunk logits.clone() to avoid 5.68 GiB OOM at 12K seq_len (248K vocab)
    --log-probs-chunk-size 4096
 )
 
@@ -157,7 +130,7 @@ OPTIMIZER_ARGS=(
 MLFLOW_ARGS=(
    --use-mlflow
    --mlflow-experiment-name slime-lora-megatron
-   --mlflow-run-name qwen3.5-122B-A10B-dapo-lora
+   --mlflow-run-name qwen3.5-122B-A10B-dapo-lora-2node
 )
 
 SGLANG_ARGS=(
@@ -179,7 +152,7 @@ MISC_ARGS=(
    --moe-token-dispatcher-type alltoall
 )
 
-# ── Ray setup (port 6381 to avoid SkyPilot conflict on k8s) ─────────────
+# ── Ray setup (head node only — worker must join before this runs) ─────
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 export no_proxy="127.0.0.1,${MASTER_ADDR}"
 
@@ -190,6 +163,19 @@ ray start --head \
     --dashboard-host=0.0.0.0 \
     --dashboard-port=${RAY_DASHBOARD_PORT} \
     --disable-usage-stats
+
+# Wait for worker to join
+echo "Waiting for 2 nodes in Ray cluster..."
+for i in $(seq 1 60); do
+    NODE_COUNT=$(ray status 2>/dev/null | grep -c "node_" || echo "0")
+    RAY_NODES=$(python3 -c "import ray; ray.init(address='auto'); print(len(ray.nodes()))" 2>/dev/null || echo "0")
+    if [ "$RAY_NODES" -ge "$NUM_NODES" ]; then
+        echo "All $NUM_NODES nodes joined!"
+        break
+    fi
+    echo "  Waiting... ($RAY_NODES/$NUM_NODES nodes, attempt $i/60)"
+    sleep 10
+done
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
@@ -204,7 +190,7 @@ RUNTIME_ENV_JSON="{
 ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
-   --actor-num-nodes 1 \
+   --actor-num-nodes ${NUM_NODES} \
    --actor-num-gpus-per-node $GPUS_PER_NODE \
    --colocate \
    --calculate-per-token-loss \

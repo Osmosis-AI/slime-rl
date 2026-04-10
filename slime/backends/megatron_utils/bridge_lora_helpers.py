@@ -6,13 +6,16 @@ forward / backward / optimizer logic.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from argparse import Namespace
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 from megatron.core.utils import get_attr_wrapped_model
 
 from .lora_utils import create_lora_instance
+from .model_provider import _propagate_fp8_config
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +252,7 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
     provider.variable_seq_lengths = True
     provider.moe_token_dispatcher_type = "alltoall"
     provider.moe_router_load_balancing_type = "none"
+    _propagate_fp8_config(provider, args)
     provider.finalize()
 
     lora = create_lora_instance(args)
@@ -271,5 +275,23 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
     ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
     ddp_config.finalize()
 
-    model = provider.provide_distributed_model(wrap_with_ddp=True, ddp_config=ddp_config)
+    # fp8_model_init: initializes model weights in FP8 format when --fp8-param-gather
+    # is set, halving memory for weight storage and TP allgather communication.
+    build_model_context = nullcontext
+    build_model_context_args = {}
+    if getattr(args, "fp8_param_gather", False):
+        try:
+            from transformer_engine.pytorch import fp8_model_init
+
+            build_model_context = fp8_model_init
+            build_model_context_args["enabled"] = True
+            if "preserve_high_precision_init_val" in inspect.signature(fp8_model_init).parameters:
+                build_model_context_args["preserve_high_precision_init_val"] = True
+        except Exception as e:
+            raise RuntimeError(
+                "--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found."
+            ) from e
+
+    with build_model_context(**build_model_context_args):
+        model = provider.provide_distributed_model(wrap_with_ddp=True, ddp_config=ddp_config)
     return model
