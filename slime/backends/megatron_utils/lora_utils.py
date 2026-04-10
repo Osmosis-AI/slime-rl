@@ -10,6 +10,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from megatron.core import mpu
+from safetensors.torch import save_file
+
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +313,7 @@ def save_lora_checkpoint(
     # Only one rank writes the HF PEFT files (bridge already gathered across TP)
     if is_dp_rank_0 and tp_rank == 0:
         torch.save(lora_state_dict, save_path / "adapter_model.bin")
+        save_file(lora_state_dict, save_path / "adapter_model.safetensors")
 
         target_modules_hf = (
             convert_target_modules_to_hf(list(args.target_modules))
