@@ -2,7 +2,7 @@
 # Benchmark: V0 fused MoE backward vs standard autograd on Qwen3.5-35B-A3B
 #
 # Based on slime-rl/main production config (scripts/run-qwen3.5-35B-A3B.sh)
-# but with EP=1 (required by fused MoE backward) and 10 steps only.
+# but with 10 steps only for benchmarking.
 #
 # Runs sequentially:
 #   1. FFT + fused MoE backward (V0 Triton kernels)
@@ -26,6 +26,19 @@ pkill -9 ray 2>/dev/null || true
 pkill -9 python 2>/dev/null || true
 
 set -ex
+
+# Download model if not present
+if [ ! -f /root/Qwen3.5-35B-A3B/config.json ]; then
+    echo "Downloading Qwen3.5-35B-A3B..."
+    huggingface-cli download Qwen/Qwen3.5-35B-A3B --local-dir /root/Qwen3.5-35B-A3B
+fi
+
+# Download gsm8k data if not present
+if [ ! -f /root/gsm8k/train.parquet ]; then
+    echo "Downloading gsm8k..."
+    mkdir -p /root/gsm8k
+    python3 -c "from datasets import load_dataset; ds = load_dataset('openai/gsm8k', 'main'); ds['train'].to_parquet('/root/gsm8k/train.parquet')"
+fi
 
 export PYTHONBUFFERED=16
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
