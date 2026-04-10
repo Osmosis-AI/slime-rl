@@ -361,7 +361,6 @@ spec:
             --actor-num-gpus-per-node \$GPUS_PER_NODE \
             --colocate \
             --calculate-per-token-loss \
-            --use-slime-router \
             \${MODEL_ARGS[@]} \
             --hf-checkpoint ${MODEL_PATH} \
             --megatron-to-hf-mode bridge \
