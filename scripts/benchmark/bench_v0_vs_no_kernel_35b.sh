@@ -30,7 +30,7 @@ set -ex
 # Download model if not present
 if [ ! -f /root/Qwen3.5-35B-A3B/config.json ]; then
     echo "Downloading Qwen3.5-35B-A3B..."
-    huggingface-cli download Qwen/Qwen3.5-35B-A3B --local-dir /root/Qwen3.5-35B-A3B
+    python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3.5-35B-A3B', local_dir='/root/Qwen3.5-35B-A3B')"
 fi
 
 # Download gsm8k data if not present
