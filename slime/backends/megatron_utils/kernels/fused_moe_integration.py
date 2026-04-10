@@ -18,14 +18,6 @@ def _load_fused_experts_impl():
     return fused_experts_impl
 
 
-def _extract_topk_output(topk_output) -> tuple[torch.Tensor, torch.Tensor]:
-    if hasattr(topk_output, "topk_weights") and hasattr(topk_output, "topk_ids"):
-        return topk_output.topk_weights, topk_output.topk_ids
-    if isinstance(topk_output, tuple) and len(topk_output) >= 2:
-        return topk_output[0], topk_output[1]
-    raise TypeError("Unsupported top-k output type for fused MoE integration.")
-
-
 def _stack_grouped_expert_weights(linear_module: torch.nn.Module) -> torch.Tensor:
     expert_weights: list[tuple[int, torch.Tensor]] = []
 
@@ -89,17 +81,25 @@ def patch_grouped_experts_module(module: torch.nn.Module) -> bool:
 
     original_forward = module.forward
 
-    def fused_forward(self, hidden_states, topk_output, *args, **kwargs):
-        del args, kwargs
+    def fused_forward(self, permuted_local_hidden_states, tokens_per_expert, permuted_probs):
+        """Fused MoE forward matching Megatron-Core ExpertsInterface.
 
-        routed_hidden_states, original_shape = _reshape_hidden_states(hidden_states)
-        topk_weights, topk_ids = _extract_topk_output(topk_output)
+        The token dispatcher has already sorted tokens by local expert and
+        communicated them to the correct EP rank. We reconstruct topk_ids from
+        tokens_per_expert (topk=1 per dispatched token) and delegate to the
+        fused Triton backward kernels.
+        """
+        routed_hidden_states, original_shape = _reshape_hidden_states(permuted_local_hidden_states)
 
-        topk_weights = topk_weights.reshape(routed_hidden_states.shape[0], -1).contiguous()
-        topk_ids = topk_ids.reshape(routed_hidden_states.shape[0], -1).to(dtype=torch.int64).contiguous()
+        # Build topk_ids from tokens_per_expert — tokens are pre-sorted by
+        # local expert, each dispatched token maps to exactly one expert.
+        num_local_experts = tokens_per_expert.shape[0]
+        topk_ids = torch.repeat_interleave(
+            torch.arange(num_local_experts, device=routed_hidden_states.device, dtype=torch.int64),
+            tokens_per_expert,
+        ).unsqueeze(1)  # (num_tokens, 1)
 
-        if (topk_ids < 0).any():
-            raise RuntimeError("Fused MoE backward only supports local expert ids in the EP=1 path.")
+        topk_weights = permuted_probs.unsqueeze(-1).to(dtype=routed_hidden_states.dtype)
 
         fused_experts_impl = _load_fused_experts_impl()
         w1 = _stack_grouped_expert_weights(self.linear_fc1)
@@ -108,11 +108,12 @@ def patch_grouped_experts_module(module: torch.nn.Module) -> bool:
             routed_hidden_states.to(dtype=torch.bfloat16),
             w1,
             w2,
-            topk_weights.to(dtype=routed_hidden_states.dtype),
+            topk_weights,
             topk_ids,
         )
-        output = output.to(dtype=hidden_states.dtype)
-        return _restore_hidden_states(output, original_shape)
+        output = output.to(dtype=permuted_local_hidden_states.dtype)
+        output = _restore_hidden_states(output, original_shape)
+        return output, None  # (output, bias) — ExpertsInterface contract
 
     module._slime_fused_moe_original_forward = original_forward
     module.forward = types.MethodType(fused_forward, module)

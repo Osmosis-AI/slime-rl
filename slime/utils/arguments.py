@@ -1651,8 +1651,6 @@ def slime_validate_args(args):
             raise ValueError("--use-fused-moe-backward currently requires --megatron-to-hf-mode bridge.")
         if getattr(args, "num_experts", 0) <= 0:
             raise ValueError("--use-fused-moe-backward requires a MoE model with --num-experts > 0.")
-        if getattr(args, "expert_model_parallel_size", 1) != 1:
-            raise ValueError("--use-fused-moe-backward currently requires --expert-model-parallel-size 1.")
         if getattr(args, "expert_tensor_parallel_size", 1) != 1:
             raise ValueError("--use-fused-moe-backward currently requires --expert-tensor-parallel-size 1.")
         if getattr(args, "fp16", False):

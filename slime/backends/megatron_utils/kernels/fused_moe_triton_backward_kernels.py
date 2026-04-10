@@ -7,6 +7,37 @@ import triton
 import triton.language as tl
 
 
+def build_expert_block_mapping(
+    expert_ids: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build CSR-style index mapping each expert to its M-blocks.
+
+    Args:
+        expert_ids: Expert ID for each M-block, from moe_align_block_size.
+                    Shape (num_m_blocks,). Padding blocks have value -1.
+        num_experts: Total number of experts.
+
+    Returns:
+        sorted_block_ids: M-block indices sorted by expert. Shape (num_valid_blocks,), int32.
+        expert_offsets: CSR offsets. Expert e owns blocks at
+                        sorted_block_ids[expert_offsets[e]:expert_offsets[e+1]].
+                        Shape (num_experts + 1,), int32.
+    """
+    valid_mask = expert_ids >= 0
+    valid_experts = expert_ids[valid_mask]
+    valid_indices = torch.arange(expert_ids.shape[0], device=expert_ids.device)[valid_mask]
+
+    sort_order = torch.argsort(valid_experts.int(), stable=True)
+    sorted_block_ids = valid_indices[sort_order].to(torch.int32)
+
+    counts = torch.bincount(valid_experts.int(), minlength=num_experts)
+    expert_offsets = torch.zeros(num_experts + 1, dtype=torch.int32, device=expert_ids.device)
+    torch.cumsum(counts.int(), dim=0, out=expert_offsets[1:])
+
+    return sorted_block_ids, expert_offsets
+
+
 @triton.jit
 def fused_moe_backward_input_kernel(
     grad_output_ptr,
@@ -193,6 +224,113 @@ def fused_moe_backward_weight_kernel(
 
 
 @triton.jit
+def fused_moe_backward_weight_kernel_v1(
+    grad_output_ptr,
+    input_ptr,
+    grad_weight_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    sorted_block_ids_ptr,
+    expert_offsets_ptr,
+    N,
+    K,
+    num_tokens_post_padded,
+    num_valid_tokens,
+    stride_gom,
+    stride_gon,
+    stride_im,
+    stride_ik,
+    stride_gwe,
+    stride_gwn,
+    stride_gwk,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+):
+    """Expert-parallel backward_weight kernel (V1).
+
+    Grid: (num_experts * num_N_blocks,). Each thread block owns ALL M-blocks
+    for one expert. Accumulates grad_out.T @ inp in registers — zero atomics.
+    """
+    pid = tl.program_id(axis=0)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    expert_id = (pid // num_pid_n).to(tl.int64)
+    pid_n = pid % num_pid_n
+
+    block_start = tl.load(expert_offsets_ptr + expert_id).to(tl.int32)
+    block_end = tl.load(expert_offsets_ptr + expert_id + 1).to(tl.int32)
+    num_blocks = block_end - block_start
+    if num_blocks == 0:
+        return
+
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+
+    for k_block in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        offs_k = k_block * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
+        acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_K), dtype=tl.float32)
+
+        block_idx = block_start
+        while block_idx < block_end:
+            m_block = tl.load(sorted_block_ids_ptr + block_idx).to(tl.int32)
+            offs_token_id = m_block * BLOCK_SIZE_M + offs_m.to(tl.int64)
+            offs_token = tl.load(
+                sorted_token_ids_ptr + offs_token_id,
+                mask=offs_token_id < num_tokens_post_padded,
+                other=num_valid_tokens,
+            )
+            offs_token = offs_token.to(tl.int64)
+            token_mask = (offs_token_id < num_tokens_post_padded) & (offs_token < num_valid_tokens)
+            offs_token_clamped = tl.where(token_mask, offs_token, 0)
+
+            # Load grad_output slice
+            grad_output_ptrs = grad_output_ptr + (
+                offs_token_clamped[:, None] * stride_gom + offs_n[None, :] * stride_gon
+            )
+            grad_out = tl.load(
+                grad_output_ptrs,
+                mask=token_mask[:, None] & (offs_n[None, :] < N),
+                other=0.0,
+            )
+
+            if MUL_ROUTED_WEIGHT:
+                moe_weight = tl.load(topk_weights_ptr + offs_token_clamped, mask=token_mask, other=0.0)
+                grad_out = grad_out * moe_weight[:, None]
+
+            grad_out = grad_out * token_mask[:, None]
+
+            # Load input slice
+            if MUL_ROUTED_WEIGHT:
+                input_token_idx = offs_token_clamped
+                input_mask = token_mask
+            else:
+                input_token_idx = offs_token_clamped // top_k
+                num_input_tokens = num_valid_tokens // top_k
+                input_mask = token_mask & (input_token_idx < num_input_tokens)
+
+            input_ptrs = input_ptr + (input_token_idx[:, None] * stride_im + offs_k[None, :] * stride_ik)
+            inp = tl.load(
+                input_ptrs,
+                mask=input_mask[:, None] & (offs_k[None, :] < K),
+                other=0.0,
+            )
+            inp = inp * input_mask[:, None]
+
+            acc += tl.dot(grad_out.T, inp)
+            block_idx += 1
+
+        # Single store — no atomics
+        grad_weight_ptrs = (
+            grad_weight_ptr + expert_id * stride_gwe + offs_n[:, None] * stride_gwn + offs_k[None, :] * stride_gwk
+        )
+        grad_weight_mask = (offs_n[:, None] < N) & (offs_k[None, :] < K)
+        tl.store(grad_weight_ptrs, acc.to(compute_type), mask=grad_weight_mask)
+
+
+@triton.jit
 def fused_moe_backward_topk_weights_kernel(
     grad_output_ptr,
     input_ptr,
@@ -293,6 +431,7 @@ def invoke_fused_moe_backward_kernel(
     top_k: int,
     config: dict[str, Any],
     compute_type: tl.dtype,
+    use_expert_parallel: bool = False,
 ) -> None:
     del topk_ids
     assert topk_weights.stride(1) == 1
@@ -301,8 +440,9 @@ def invoke_fused_moe_backward_kernel(
     if grad_output.ndim == 3:
         grad_output = grad_output.reshape(-1, grad_output.shape[-1])
 
-    _, N, K = weight.shape
+    num_experts, N, K = weight.shape
 
+    # --- backward_input (unchanged, still uses atomics) ---
     def grid_input(meta):
         return (triton.cdiv(sorted_token_ids.shape[0], meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
 
@@ -332,36 +472,76 @@ def invoke_fused_moe_backward_kernel(
         **config,
     )
 
-    grad_weight.zero_()
+    # --- backward_weight ---
+    if use_expert_parallel:
+        # V1: expert-parallel grid, zero atomics, no zeroing needed
+        sorted_block_ids, expert_offsets = build_expert_block_mapping(expert_ids, num_experts)
 
-    def grid_weight(meta):
-        return (triton.cdiv(sorted_token_ids.shape[0], meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
+        def grid_weight_v1(meta):
+            return (num_experts * triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
 
-    fused_moe_backward_weight_kernel[grid_weight](
-        grad_output,
-        input,
-        grad_weight,
-        topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        N,
-        K,
-        sorted_token_ids.shape[0],
-        grad_output.shape[0],
-        grad_output.stride(0),
-        grad_output.stride(1),
-        input.stride(0),
-        input.stride(1),
-        grad_weight.stride(0),
-        grad_weight.stride(1),
-        grad_weight.stride(2),
-        MUL_ROUTED_WEIGHT=mul_routed_weight,
-        top_k=top_k,
-        compute_type=compute_type,
-        **config,
-    )
+        # Load num_tokens_post_padded as a Python int for the V1 kernel
+        ntp = num_tokens_post_padded.item()
 
+        fused_moe_backward_weight_kernel_v1[grid_weight_v1](
+            grad_output,
+            input,
+            grad_weight,
+            topk_weights,
+            sorted_token_ids,
+            sorted_block_ids,
+            expert_offsets,
+            N,
+            K,
+            ntp,
+            grad_output.shape[0],
+            grad_output.stride(0),
+            grad_output.stride(1),
+            input.stride(0),
+            input.stride(1),
+            grad_weight.stride(0),
+            grad_weight.stride(1),
+            grad_weight.stride(2),
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            top_k=top_k,
+            compute_type=compute_type,
+            BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
+            BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
+            BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
+        )
+    else:
+        # V0: original atomic-based backward_weight
+        grad_weight.zero_()
+
+        def grid_weight(meta):
+            return (triton.cdiv(sorted_token_ids.shape[0], meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
+
+        fused_moe_backward_weight_kernel[grid_weight](
+            grad_output,
+            input,
+            grad_weight,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            N,
+            K,
+            sorted_token_ids.shape[0],
+            grad_output.shape[0],
+            grad_output.stride(0),
+            grad_output.stride(1),
+            input.stride(0),
+            input.stride(1),
+            grad_weight.stride(0),
+            grad_weight.stride(1),
+            grad_weight.stride(2),
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            top_k=top_k,
+            compute_type=compute_type,
+            **config,
+        )
+
+    # --- backward_topk_weights (unchanged) ---
     if mul_routed_weight and grad_topk_weights is not None:
 
         def grid_topk(meta):

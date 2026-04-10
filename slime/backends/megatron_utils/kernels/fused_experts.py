@@ -19,6 +19,10 @@ DEFAULT_CONFIG = {
 }
 CHUNK_SIZE = 64 * 1024
 
+# V1 expert-parallel backward_weight: eliminates tl.atomic_add contention.
+# Set to False to revert to V0 (atomic-based) for A/B benchmarking.
+USE_EXPERT_PARALLEL = True
+
 
 class GateUpProjFunction(torch.autograd.Function):
     @staticmethod
@@ -89,7 +93,8 @@ class GateUpProjFunction(torch.autograd.Function):
         topk = ctx.topk
 
         grad_hidden_states = torch.zeros_like(hidden_states)
-        grad_w1 = torch.zeros_like(w1)
+        # V1 writes all locations via tl.store — no zeroing needed
+        grad_w1 = torch.empty_like(w1) if USE_EXPERT_PARALLEL else torch.zeros_like(w1)
         grad_topk_weights = torch.zeros_like(topk_weights)
 
         for chunk in range((num_tokens // CHUNK_SIZE) + 1):
@@ -111,7 +116,7 @@ class GateUpProjFunction(torch.autograd.Function):
             )
 
             curr_grad_hidden_states = torch.zeros_like(curr_hidden_states)
-            curr_grad_w1 = torch.zeros_like(w1)
+            curr_grad_w1 = torch.empty_like(w1) if USE_EXPERT_PARALLEL else torch.zeros_like(w1)
 
             invoke_fused_moe_backward_kernel(
                 grad_output=curr_grad_output,
@@ -129,10 +134,18 @@ class GateUpProjFunction(torch.autograd.Function):
                 top_k=topk,
                 config=DEFAULT_CONFIG,
                 compute_type=tl.bfloat16,
+                use_expert_parallel=USE_EXPERT_PARALLEL,
             )
 
             grad_hidden_states[begin_chunk_idx:end_chunk_idx] += curr_grad_hidden_states
-            grad_w1 += curr_grad_w1
+            if USE_EXPERT_PARALLEL:
+                # V1: curr_grad_w1 is the complete gradient (no accumulation needed for single chunk)
+                if chunk == 0:
+                    grad_w1 = curr_grad_w1
+                else:
+                    grad_w1 += curr_grad_w1
+            else:
+                grad_w1 += curr_grad_w1
 
         return grad_hidden_states, grad_w1, grad_topk_weights, None
 
@@ -233,7 +246,7 @@ class DownProjFunction(torch.autograd.Function):
         topk = ctx.topk
 
         grad_intermediate_cache2 = torch.zeros_like(intermediate_cache2)
-        grad_w2 = torch.zeros_like(w2)
+        grad_w2 = torch.empty_like(w2) if USE_EXPERT_PARALLEL else torch.zeros_like(w2)
         grad_topk_weights = torch.zeros_like(topk_weights)
 
         for chunk in range((num_tokens // CHUNK_SIZE) + 1):
@@ -255,7 +268,7 @@ class DownProjFunction(torch.autograd.Function):
             )
 
             curr_grad_intermediate_cache2 = torch.zeros_like(curr_intermediate_cache2)
-            curr_grad_w2 = torch.zeros_like(w2)
+            curr_grad_w2 = torch.empty_like(w2) if USE_EXPERT_PARALLEL else torch.zeros_like(w2)
             curr_grad_topk_weights = torch.zeros_like(curr_topk_weights)
 
             invoke_fused_moe_backward_kernel(
@@ -274,10 +287,17 @@ class DownProjFunction(torch.autograd.Function):
                 top_k=1,
                 config=DEFAULT_CONFIG,
                 compute_type=tl.bfloat16,
+                use_expert_parallel=USE_EXPERT_PARALLEL,
             )
 
             grad_intermediate_cache2[begin_chunk_idx * topk : end_chunk_idx * topk] = curr_grad_intermediate_cache2
-            grad_w2 += curr_grad_w2
+            if USE_EXPERT_PARALLEL:
+                if chunk == 0:
+                    grad_w2 = curr_grad_w2
+                else:
+                    grad_w2 += curr_grad_w2
+            else:
+                grad_w2 += curr_grad_w2
             grad_topk_weights[begin_chunk_idx:end_chunk_idx] = curr_grad_topk_weights
 
         return grad_intermediate_cache2, grad_w2, grad_topk_weights, None

@@ -141,6 +141,8 @@ def run_layer_parity(args):
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark or parity-check fused MoE kernels.")
     parser.add_argument("--mode", choices=["micro", "parity"], default="micro")
+    parser.add_argument("--variant", choices=["v0", "v1"], default="v1",
+                        help="Kernel variant: v0=baseline atomics, v1=expert-parallel (default)")
     parser.add_argument("--num-tokens", type=int, default=256)
     parser.add_argument("--hidden-size", type=int, default=2048)
     parser.add_argument("--ffn-hidden-size", type=int, default=512)
@@ -154,6 +156,12 @@ if __name__ == "__main__":
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires CUDA.")
+
+    # Set kernel variant
+    import slime.backends.megatron_utils.kernels.fused_experts as fe
+    fe.USE_EXPERT_PARALLEL = (args.variant == "v1")
+    print(f"Kernel variant: {args.variant} (USE_EXPERT_PARALLEL={fe.USE_EXPERT_PARALLEL})")
+
     if args.mode == "micro":
         run_microbenchmark(args)
     else:
