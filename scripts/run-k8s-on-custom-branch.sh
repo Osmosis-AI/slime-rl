@@ -70,6 +70,8 @@ Environment overrides:
   SLIME_REPO_URL     Git repository URL to clone inside the pod
   SLIME_REPO_BRANCH  Branch to clone inside the pod (default: dev)
   SLIME_RUNTIME_DIR  Clone destination inside the pod (default: /root/slime-rl-runtime)
+  CHECKPOINT_DIR     Checkpoint root on the mounted Weka volume
+  SAVE_INTERVAL      Save cadence in rollouts (default: 1)
 EOF
 }
 
@@ -132,6 +134,8 @@ DATA_ROOT="/data/test-lora-gsm8k"
 MODEL_PATH="${DATA_ROOT}/Qwen3.5-35B-A3B"
 TRAIN_DATA="${DATA_ROOT}/gsm8k/train.parquet"
 TEST_DATA="${DATA_ROOT}/gsm8k/test.parquet"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-${DATA_ROOT}/checkpoints/${JOB_NAME}}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-1}"
 
 MLFLOW_EXPERIMENT_NAME="${MLFLOW_EXPERIMENT_NAME:-slime-test-lora}"
 MLFLOW_RUN_NAME="${MLFLOW_RUN_NAME:-${JOB_NAME}}"
@@ -273,6 +277,8 @@ echo "    repo:       ${SLIME_REPO_URL}"
 echo "    branch:     ${SLIME_REPO_BRANCH}"
 echo "    model:      ${MODEL_PATH}"
 echo "    train data: ${TRAIN_DATA}"
+echo "    save dir:   ${CHECKPOINT_DIR}"
+echo "    save every: ${SAVE_INTERVAL} rollouts"
 echo "    mlflow exp: ${MLFLOW_EXPERIMENT_NAME}"
 echo "    mlflow run: ${MLFLOW_RUN_NAME}"
 echo "    stop job:   ${STOP_JOB_CMD}"
@@ -368,6 +374,8 @@ spec:
             --lora-alpha 32 \
             --lora-dropout 0.0 \
             --target-modules "all-linear" \
+            --save ${CHECKPOINT_DIR} \
+            --save-interval ${SAVE_INTERVAL} \
             --prompt-data ${TRAIN_DATA} \
             --input-key messages \
             --label-key label \

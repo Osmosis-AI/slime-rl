@@ -1,5 +1,6 @@
 """LoRA utilities for Megatron backend using Megatron-Bridge PEFT integration."""
 
+import json
 import logging
 import os
 from argparse import Namespace
@@ -10,6 +11,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from megatron.core import mpu
+from safetensors.torch import save_file
+
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +72,8 @@ _MEGATRON_TO_HF_MODULES = {
     "linear_fc1_up": ["up_proj"],
 }
 
-_HF_MODULE_NAMES = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+_DEFAULT_HF_TARGET_MODULES = list(_STANDARD_LORA_HF_TO_MEGATRON)
+_HF_MODULE_NAMES = set(_DEFAULT_HF_TARGET_MODULES)
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +107,79 @@ def _is_adapter_param_name(name: str) -> bool:
     return "lora_" in name or (".adapter." in name and ("linear_in" in name or "linear_out" in name))
 
 
+def _materialize_tensor_for_safetensors(tensor: torch.Tensor) -> torch.Tensor:
+    """Return an independent CPU tensor suitable for safetensors serialization."""
+    # Megatron-Bridge can export logical adapter tensors as views into shared storage
+    # for fused projections (for example gate_proj/up_proj). safetensors rejects shared
+    # storage for dict saves, so each key needs its own contiguous CPU buffer.
+    return tensor.detach().to(device="cpu", copy=True).contiguous()
+
+
+def _dedupe_preserve_order(modules: Sequence[str]) -> list[str]:
+    """Return modules without duplicates while preserving their original order."""
+    deduped: list[str] = []
+    for module in modules:
+        if module not in deduped:
+            deduped.append(module)
+    return deduped
+
+
+def _resolve_base_model_name_or_path(args: Namespace) -> str | None:
+    """Resolve the most portable base model identifier available for adapter metadata."""
+    explicit = getattr(args, "base_model_name_or_path", None)
+    if explicit:
+        return explicit
+
+    hf_checkpoint = getattr(args, "hf_checkpoint", None)
+    if hf_checkpoint is None:
+        return None
+
+    checkpoint_path = Path(hf_checkpoint)
+    if not checkpoint_path.is_dir():
+        return hf_checkpoint
+
+    config_path = checkpoint_path / "config.json"
+    if config_path.exists():
+        try:
+            config_json = json.loads(config_path.read_text())
+        except json.JSONDecodeError:
+            config_json = {}
+
+        for key in ("base_model_name_or_path", "_name_or_path", "name_or_path", "model_name_or_path"):
+            value = config_json.get(key)
+            if isinstance(value, str) and value and value != hf_checkpoint:
+                return value
+
+    return hf_checkpoint
+
+
+def _resolve_modules_arg_to_hf(
+    modules: str | Sequence[str] | None,
+    *,
+    lora_type: type | object | None,
+) -> list[str] | None:
+    """Resolve an arbitrary module list/string to canonical HF module names."""
+    normalized_modules = _normalize_modules_arg(modules)
+    if normalized_modules is None:
+        return None
+
+    megatron_modules = convert_target_modules_to_megatron(normalized_modules, lora_type=lora_type)
+    return _dedupe_preserve_order(convert_target_modules_to_hf(megatron_modules))
+
+
+def _resolve_modules_arg_to_megatron(
+    modules: str | Sequence[str] | None,
+    *,
+    lora_type: type | object | None,
+) -> list[str] | None:
+    """Resolve an arbitrary module list/string to Megatron module names."""
+    normalized_modules = _normalize_modules_arg(modules)
+    if normalized_modules is None:
+        return None
+
+    return convert_target_modules_to_megatron(normalized_modules, lora_type=lora_type)
+
+
 # ---------------------------------------------------------------------------
 # Module name conversion
 # ---------------------------------------------------------------------------
@@ -112,6 +189,8 @@ def _get_lora_class_name(lora_type: type | object | None) -> str:
     """Resolve LoRA type to its class name string."""
     if lora_type is None:
         return "CanonicalLoRA"
+    if isinstance(lora_type, str):
+        return "CanonicalLoRA" if lora_type.lower() == "canonical_lora" else "LoRA"
     if isinstance(lora_type, type):
         return lora_type.__name__
     return type(lora_type).__name__
@@ -184,19 +263,6 @@ def convert_target_modules_to_hf(megatron_modules: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def parse_exclude_modules(args: Namespace, lora_type=None) -> list[str]:
-    """Parse and convert exclude_modules argument."""
-    exclude_modules: list[str] = []
-    raw = getattr(args, "exclude_modules", None)
-    if raw:
-        if isinstance(raw, str):
-            exclude_modules = [m.strip() for m in raw.split(",")]
-        else:
-            exclude_modules = list(raw)
-        exclude_modules = convert_target_modules_to_megatron(exclude_modules, lora_type=lora_type)
-    return exclude_modules
-
-
 def create_lora_instance(args: Namespace):
     """Create a LoRA or CanonicalLoRA instance based on args.
 
@@ -213,8 +279,8 @@ def create_lora_instance(args: Namespace):
     else:
         lora_cls = LoRA
 
-    target_modules = convert_target_modules_to_megatron(args.target_modules, lora_type=lora_cls)
-    exclude_modules = parse_exclude_modules(args, lora_type=lora_cls)
+    target_modules = _resolve_modules_arg_to_megatron(args.target_modules, lora_type=lora_cls)
+    exclude_modules = _resolve_modules_arg_to_megatron(getattr(args, "exclude_modules", None), lora_type=lora_cls) or []
 
     lora = lora_cls(
         target_modules=target_modules,
@@ -232,6 +298,105 @@ def create_lora_instance(args: Namespace):
         f"exclude_modules={exclude_modules}"
     )
     return lora
+
+
+def _normalize_modules_arg(modules: str | Sequence[str] | None) -> list[str] | None:
+    """Normalize a module-list argument to a clean list without changing semantics."""
+    if modules is None:
+        return None
+    if isinstance(modules, str):
+        normalized = [module.strip() for module in modules.split(",") if module.strip()]
+        return normalized or None
+    normalized = [str(module).strip() for module in modules if str(module).strip()]
+    return normalized or None
+
+
+def resolve_target_modules_to_hf(args: Namespace) -> list[str]:
+    """Resolve args.target_modules to canonical HF module names for saved/runtime configs."""
+    target_modules = _resolve_modules_arg_to_hf(
+        getattr(args, "target_modules", None),
+        lora_type=getattr(args, "lora_type", None),
+    )
+    if target_modules is None:
+        return list(_DEFAULT_HF_TARGET_MODULES)
+    return target_modules
+
+
+def resolve_exclude_modules_to_hf(args: Namespace) -> list[str] | None:
+    """Resolve args.exclude_modules to canonical HF module names for PEFT metadata."""
+    return _resolve_modules_arg_to_hf(
+        getattr(args, "exclude_modules", None),
+        lora_type=getattr(args, "lora_type", None),
+    )
+
+
+def build_lora_adapter_config(args: Namespace) -> dict[str, Any]:
+    """Build the shared PEFT-compatible adapter config for save and live sync."""
+    base_model_name_or_path = _resolve_base_model_name_or_path(args)
+    target_modules = resolve_target_modules_to_hf(args)
+    exclude_modules = resolve_exclude_modules_to_hf(args)
+    revision = getattr(args, "revision", None)
+
+    config = {
+        "base_model_name_or_path": base_model_name_or_path,
+        "bias": "none",
+        "fan_in_fan_out": False,
+        "inference_mode": True,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
+        "peft_type": "LORA",
+        "r": args.lora_rank,
+        "target_modules": target_modules,
+        "task_type": "CAUSAL_LM",
+    }
+
+    if exclude_modules is not None:
+        config["exclude_modules"] = exclude_modules
+    if revision is not None:
+        config["revision"] = revision
+
+    return config
+
+
+def iter_exported_lora_weights(
+    args: Namespace,
+    model: Sequence[torch.nn.Module],
+    *,
+    bridge: Any | None = None,
+    cpu: bool,
+    quantization_config: dict[str, Any] | None = None,
+):
+    """Yield LoRA weights in the same HF-facing form used by SGLang weight sync."""
+    from megatron.bridge import AutoBridge
+
+    from slime.utils import megatron_bridge_utils
+
+    from .megatron_to_hf import postprocess_hf_param
+    from .megatron_to_hf.processors import quantize_params
+
+    if bridge is None:
+        import slime_plugins.megatron_bridge  # noqa: F401
+
+        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+
+    with megatron_bridge_utils.patch_megatron_model(model):
+        for hf_name, weight, megatron_name in bridge.export_adapter_weights(
+            model,
+            cpu=cpu,
+            show_progress=False,
+        ):
+            processed_weight = postprocess_hf_param(
+                args=args,
+                megatron_param_name=megatron_name,
+                hf_param_name=hf_name,
+                param=weight,
+            )
+            yield from quantize_params(
+                args=args,
+                megatron_name=megatron_name,
+                converted_named_params=[(hf_name, processed_weight)],
+                quantization_config=quantization_config,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -265,12 +430,6 @@ def save_lora_checkpoint(
     This function is collective: **all ranks must call it** because the bridge
     export performs TP all-gather internally. Only ``dp_rank == 0`` writes files.
     """
-    import json
-
-    from megatron.bridge import AutoBridge
-
-    from slime.utils import megatron_bridge_utils
-
     save_path = Path(save_dir)
     is_dp_rank_0 = mpu.get_data_parallel_rank() == 0
     tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -294,40 +453,26 @@ def save_lora_checkpoint(
         torch.save(adapter_state, native_path)
         logger.info(f"Saved {len(adapter_state)} adapter tensors (native) to {native_path}")
 
-    # ---- HF PEFT format (uses bridge for correct name/weight conversion) ----
-    # Bridge export is collective: all TP ranks participate in the all-gather,
-    # so every rank must call export_adapter_weights.
-    bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
-
-    lora_state_dict: dict[str, torch.Tensor] = {}
-    with megatron_bridge_utils.patch_megatron_model(model):
-        for hf_name, weight, _megatron_name in bridge.export_adapter_weights(
+    # ---- HF PEFT format (uses the same export path as live SGLang sync) ----
+    lora_state_dict = {
+        hf_name: weight
+        for hf_name, weight in iter_exported_lora_weights(
+            args,
             model,
             cpu=True,
-            show_progress=False,
-        ):
-            lora_state_dict[hf_name] = weight
+        )
+    }
 
     # Only one rank writes the HF PEFT files (bridge already gathered across TP)
     if is_dp_rank_0 and tp_rank == 0:
-        torch.save(lora_state_dict, save_path / "adapter_model.bin")
-
-        target_modules_hf = (
-            convert_target_modules_to_hf(list(args.target_modules))
-            if args.target_modules
-            else ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-        )
-        config = {
-            "peft_type": "LORA",
-            "r": args.lora_rank,
-            "lora_alpha": args.lora_alpha,
-            "target_modules": target_modules_hf,
-            "lora_dropout": args.lora_dropout,
-            "bias": "none",
-            "task_type": "CAUSAL_LM",
+        safetensors_state_dict = {
+            name: _materialize_tensor_for_safetensors(weight) for name, weight in lora_state_dict.items()
         }
+        torch.save(lora_state_dict, save_path / "adapter_model.bin")
+        save_file(safetensors_state_dict, save_path / "adapter_model.safetensors")
+
         with open(save_path / "adapter_config.json", "w") as f:
-            json.dump(config, f, indent=2)
+            json.dump(build_lora_adapter_config(args), f, indent=2)
 
         os.sync()
         logger.info(f"Saved HF PEFT adapter to {save_path} with {len(lora_state_dict)} tensors")
@@ -451,20 +596,3 @@ def _load_training_state(
 # LoRA config dict for weight sync to SGLang
 # ---------------------------------------------------------------------------
 
-
-def build_lora_sync_config(args: Namespace) -> dict[str, Any]:
-    """Build LoRA config dict for syncing weights to SGLang engines."""
-    target_modules_hf = (
-        convert_target_modules_to_hf(list(args.target_modules))
-        if args.target_modules
-        else ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-    )
-    return {
-        "peft_type": "LORA",
-        "r": args.lora_rank,
-        "lora_alpha": args.lora_alpha,
-        "target_modules": target_modules_hf,
-        "lora_dropout": args.lora_dropout,
-        "bias": "none",
-        "task_type": "CAUSAL_LM",
-    }

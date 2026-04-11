@@ -10,7 +10,7 @@ from megatron.core import mpu
 from ray import ObjectRef
 from ray.actor import ActorHandle
 
-from slime.backends.megatron_utils.lora_utils import LORA_ADAPTER_NAME, build_lora_sync_config, is_lora_weight_name
+from slime.backends.megatron_utils.lora_utils import LORA_ADAPTER_NAME, build_lora_adapter_config, is_lora_weight_name
 from slime.utils.distributed_utils import get_gloo_group
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
@@ -64,7 +64,7 @@ class UpdateWeightFromTensor:
             is_lora=self.is_lora,
         )
 
-        self._lora_config = build_lora_sync_config(args) if self.is_lora else None
+        self._lora_config = build_lora_adapter_config(args) if self.is_lora else None
 
         self._ipc_gather_group = None
         self._ipc_gather_src = None
