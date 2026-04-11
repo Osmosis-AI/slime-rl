@@ -6,7 +6,6 @@ import logging
 import os
 from argparse import Namespace
 from collections.abc import Sequence
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -123,21 +122,6 @@ def _dedupe_preserve_order(modules: Sequence[str]) -> list[str]:
         if module not in deduped:
             deduped.append(module)
     return deduped
-
-
-def _jsonify_config_value(value: Any) -> Any:
-    """Normalize values to the JSON-compatible shapes PEFT configs expect."""
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, set):
-        return sorted(_jsonify_config_value(item) for item in value)
-    if isinstance(value, dict):
-        return {key: _jsonify_config_value(val) for key, val in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonify_config_value(item) for item in value]
-    if isinstance(value, Path):
-        return str(value)
-    return value
 
 
 def _get_optional_peft_version() -> str | None:
@@ -367,91 +351,33 @@ def resolve_exclude_modules_to_hf(args: Namespace) -> list[str] | None:
     )
 
 
-def _build_fallback_peft_lora_config(args: Namespace) -> dict[str, Any]:
-    """Build a PEFT-compatible LoRA config without requiring peft at runtime."""
+def _build_peft_lora_config(args: Namespace) -> dict[str, Any]:
+    """Build the PEFT-compatible adapter config written alongside saved LoRAs."""
+    base_model_name_or_path = _resolve_base_model_name_or_path(args)
+    exclude_modules = resolve_exclude_modules_to_hf(args)
+    revision = _resolve_revision(args)
+
     config = {
-        "alora_invocation_tokens": None,
-        "alpha_pattern": {},
-        "arrow_config": None,
-        "auto_mapping": None,
-        "base_model_name_or_path": _resolve_base_model_name_or_path(args),
+        "base_model_name_or_path": base_model_name_or_path,
         "bias": "none",
-        "corda_config": None,
-        "ensure_weight_tying": False,
-        "eva_config": None,
-        "exclude_modules": resolve_exclude_modules_to_hf(args),
         "fan_in_fan_out": False,
         "inference_mode": True,
-        "init_lora_weights": True,
-        "layer_replication": None,
-        "layers_pattern": None,
-        "layers_to_transform": None,
-        "loftq_config": {},
         "lora_alpha": args.lora_alpha,
-        "lora_bias": False,
         "lora_dropout": args.lora_dropout,
-        "megatron_config": None,
-        "megatron_core": "megatron.core",
-        "modules_to_save": None,
         "peft_type": "LORA",
-        "qalora_group_size": 16,
         "r": args.lora_rank,
-        "rank_pattern": {},
-        "revision": _resolve_revision(args),
         "target_modules": resolve_target_modules_to_hf(args),
-        "target_parameters": None,
         "task_type": "CAUSAL_LM",
-        "trainable_token_indices": None,
-        "use_dora": False,
-        "use_qalora": False,
-        "use_rslora": False,
     }
+
+    if exclude_modules is not None:
+        config["exclude_modules"] = exclude_modules
+    if revision is not None:
+        config["revision"] = revision
+
     peft_version = _get_optional_peft_version()
     if peft_version is not None:
         config["peft_version"] = peft_version
-    return config
-
-
-def _build_peft_lora_config(args: Namespace) -> dict[str, Any]:
-    """Build a PEFT-style LoraConfig dict, using peft when available."""
-    target_modules = resolve_target_modules_to_hf(args)
-    exclude_modules = resolve_exclude_modules_to_hf(args)
-    base_model_name_or_path = _resolve_base_model_name_or_path(args)
-    revision = _resolve_revision(args)
-
-    try:
-        from peft import LoraConfig
-
-        config = _jsonify_config_value(
-            LoraConfig(
-                r=args.lora_rank,
-                lora_alpha=args.lora_alpha,
-                target_modules=target_modules,
-                lora_dropout=args.lora_dropout,
-                bias="none",
-                task_type="CAUSAL_LM",
-                base_model_name_or_path=base_model_name_or_path,
-                inference_mode=True,
-                fan_in_fan_out=False,
-                modules_to_save=None,
-                exclude_modules=exclude_modules,
-            ).to_dict()
-        )
-    except Exception:
-        config = _build_fallback_peft_lora_config(args)
-
-    config["peft_type"] = "LORA"
-    config["r"] = args.lora_rank
-    config["lora_alpha"] = args.lora_alpha
-    config["target_modules"] = target_modules
-    config["lora_dropout"] = args.lora_dropout
-    config["bias"] = "none"
-    config["task_type"] = "CAUSAL_LM"
-    config["base_model_name_or_path"] = base_model_name_or_path
-    config["exclude_modules"] = exclude_modules
-    config["fan_in_fan_out"] = False
-    config["inference_mode"] = True
-    config["revision"] = revision
     return config
 
 
