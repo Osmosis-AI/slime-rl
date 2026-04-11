@@ -70,9 +70,6 @@ class UpdateWeightFromTensor:
         self._ipc_gather_src = None
         self._ipc_engine = None
         self._model_update_groups = None
-        # CUDA IPC tensors must stay alive until all SGLang TP schedulers
-        # finish deserializing.  We keep them until the next update_weights().
-        self._prev_ipc_tensors = None
 
     def connect_rollout_engines(
         self,
@@ -154,11 +151,6 @@ class UpdateWeightFromTensor:
         """
         version++, flush caches, process buckets. Progress on rank 0.
         """
-        # Free CUDA IPC tensors from the previous sync.  By now a full
-        # training step has elapsed, so all SGLang TP schedulers have
-        # definitely finished deserializing the old handles.
-        self._prev_ipc_tensors = None
-
         self.weight_version += 1
 
         rank = dist.get_rank()
@@ -176,12 +168,11 @@ class UpdateWeightFromTensor:
         megatron_local_weights = self.weights_getter()
 
         sync_chunk_count = 0
-        all_long_lived_tensors = []
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-            refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
+            # Keep the flattened IPC tensors alive until this chunk's RPC completes.
+            refs, _long_lived_tensors = self._send_hf_params(hf_named_tensors)
             results = ray.get(refs)
             _check_weight_sync_results(results, is_lora=self.is_lora)
-            all_long_lived_tensors.append(long_lived_tensors)
             sync_chunk_count += 1
 
         if self.is_lora and sync_chunk_count == 0:
@@ -203,13 +194,6 @@ class UpdateWeightFromTensor:
                 )
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
-
-        # Keep CUDA IPC tensors alive until the NEXT update_weights() call.
-        # SGLang TP schedulers are separate processes that deserialize CUDA
-        # IPC handles asynchronously — continue_generation is NOT a barrier
-        # for all schedulers.  Storing on self ensures the underlying CUDA
-        # memory stays valid through the entire rollout phase.
-        self._prev_ipc_tensors = all_long_lived_tensors
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         all_refs = []
