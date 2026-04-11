@@ -21,7 +21,7 @@ def test_core_imports():
         is_lora_enabled,
         is_lora_model,
         LORA_ADAPTER_NAME,
-        build_lora_sync_config,
+        build_lora_adapter_config,
     )
     from slime.backends.megatron_utils.bridge_lora_helpers import (
         _setup_lora_model_via_bridge,
