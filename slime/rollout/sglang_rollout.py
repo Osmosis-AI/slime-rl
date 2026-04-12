@@ -560,7 +560,7 @@ async def eval_rollout_single_dataset(
         sample = await coro
         if isinstance(sample, list):
             data.extend(sample)
-            logged_sample = sample[-1] if sample else None
+            logged_sample = sample[0] if sample else None
         else:
             data.append(sample)
             logged_sample = sample
