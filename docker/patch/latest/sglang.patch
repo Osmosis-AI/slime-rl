@@ -1667,13 +1667,42 @@ index a9ff0ac94..c124f43bc 100644
 +            group=self.tp_cpu_group,
 +        )
 +
-+        all_success = all(success for success, _ in gathered_statuses)
++        # Normalize gathered statuses before unpacking so malformed entries
++        # become a clean LoRA update failure instead of an internal crash.
++        normalized_statuses = []
++        for status in gathered_statuses:
++            if not isinstance(status, tuple) or len(status) != 2:
++                return LoadLoRAAdapterFromTensorsReqOutput(
++                    success=False,
++                    error_message=(
++                        "Received malformed tensor-parallel LoRA update status "
++                        f"from all_gather_object: {status!r}"
++                    ),
++                )
++
++            success, error_message = status
++            if not isinstance(success, bool):
++                return LoadLoRAAdapterFromTensorsReqOutput(
++                    success=False,
++                    error_message=(
++                        "Received non-boolean tensor-parallel LoRA update status "
++                        f"from all_gather_object: {status!r}"
++                    ),
++                )
++
++            if error_message is not None and not isinstance(error_message, str):
++                error_message = str(error_message)
++
++            # Downstream logic assumes a stable (success, error_message) shape.
++            normalized_statuses.append((success, error_message))
++
++        all_success = all(success for success, _ in normalized_statuses)
 +        if all_success:
 +            return result
 +
 +        error_messages = [
 +            message
-+            for success, message in gathered_statuses
++            for success, message in normalized_statuses
 +            if not success and message is not None
 +        ]
 +        merged_error_message = " | ".join(dict.fromkeys(error_messages))
