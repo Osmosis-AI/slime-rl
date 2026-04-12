@@ -136,6 +136,7 @@ TRAIN_DATA="${DATA_ROOT}/gsm8k/train.parquet"
 TEST_DATA="${DATA_ROOT}/gsm8k/test.parquet"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${DATA_ROOT}/checkpoints/${JOB_NAME}}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-1}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
 
 MLFLOW_EXPERIMENT_NAME="${MLFLOW_EXPERIMENT_NAME:-slime-test-lora}"
 MLFLOW_RUN_NAME="${MLFLOW_RUN_NAME:-${JOB_NAME}}"
@@ -279,6 +280,7 @@ echo "    model:      ${MODEL_PATH}"
 echo "    train data: ${TRAIN_DATA}"
 echo "    save dir:   ${CHECKPOINT_DIR}"
 echo "    save every: ${SAVE_INTERVAL} rollouts"
+echo "    num rollout:${NUM_ROLLOUT}"
 echo "    mlflow exp: ${MLFLOW_EXPERIMENT_NAME}"
 echo "    mlflow run: ${MLFLOW_RUN_NAME}"
 echo "    stop job:   ${STOP_JOB_CMD}"
@@ -382,7 +384,7 @@ spec:
             --apply-chat-template \
             --rollout-shuffle \
             --rm-type math \
-            --num-rollout 100 \
+            --num-rollout ${NUM_ROLLOUT} \
             --rollout-batch-size 16 \
             --n-samples-per-prompt 8 \
             --rollout-max-response-len 10240 \
