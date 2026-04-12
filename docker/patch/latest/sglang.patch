@@ -1642,7 +1642,7 @@ index a9ff0ac94..c124f43bc 100644
                  (GetWeightsByNameReqInput, self.get_weights_by_name),
                  (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
                  (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
-@@ -2871,29 +2878,99 @@ class Scheduler(
+@@ -2871,13 +2871,92 @@ class Scheduler(
      def continue_generation(self, recv_req: ContinueGenerationReqInput):
          self._engine_paused = False
  
@@ -1660,61 +1660,70 @@ index a9ff0ac94..c124f43bc 100644
 +        if tp_world_size <= 1:
 +            return result
 +
-+        gathered_statuses = [None] * tp_world_size
-+        torch.distributed.all_gather_object(
-+            gathered_statuses,
++        is_tp_root = torch.distributed.get_rank(group=self.tp_cpu_group) == 0
++
++        gathered_statuses = [None] * tp_world_size if is_tp_root else None
++        torch.distributed.gather_object(
 +            (result.success, result.error_message),
++            object_gather_list=gathered_statuses,
 +            group=self.tp_cpu_group,
++            group_dst=0,
 +        )
 +
-+        # Normalize gathered statuses before unpacking so malformed entries
-+        # become a clean LoRA update failure instead of an internal crash.
-+        normalized_statuses = []
-+        for status in gathered_statuses:
-+            if not isinstance(status, tuple) or len(status) != 2:
-+                return LoadLoRAAdapterFromTensorsReqOutput(
-+                    success=False,
-+                    error_message=(
++        merged_result = result if is_tp_root else None
++        if is_tp_root:
++            # Normalize gathered statuses on the TP root before unpacking so
++            # malformed entries surface as a clean LoRA update failure.
++            normalized_statuses = []
++            merge_error_message = None
++            for status in gathered_statuses:
++                if not isinstance(status, tuple) or len(status) != 2:
++                    merge_error_message = (
 +                        "Received malformed tensor-parallel LoRA update status "
-+                        f"from all_gather_object: {status!r}"
-+                    ),
-+                )
++                        f"from gather_object: {status!r}"
++                    )
++                    break
 +
-+            success, error_message = status
-+            if not isinstance(success, bool):
-+                return LoadLoRAAdapterFromTensorsReqOutput(
-+                    success=False,
-+                    error_message=(
++                success, error_message = status
++                if not isinstance(success, bool):
++                    merge_error_message = (
 +                        "Received non-boolean tensor-parallel LoRA update status "
-+                        f"from all_gather_object: {status!r}"
-+                    ),
++                        f"from gather_object: {status!r}"
++                    )
++                    break
++
++                if error_message is not None and not isinstance(error_message, str):
++                    error_message = str(error_message)
++
++                # Downstream logic assumes a stable (success, error_message) shape.
++                normalized_statuses.append((success, error_message))
++
++            if merge_error_message is None:
++                if not all(success for success, _ in normalized_statuses):
++                    error_messages = [
++                        message
++                        for success, message in normalized_statuses
++                        if not success and message is not None
++                    ]
++                    merge_error_message = " | ".join(dict.fromkeys(error_messages))
++                    if not merge_error_message:
++                        merge_error_message = (
++                            "One or more tensor-parallel ranks failed while updating the LoRA adapter."
++                        )
++
++            if merge_error_message is not None:
++                merged_result = LoadLoRAAdapterFromTensorsReqOutput(
++                    success=False,
++                    error_message=merge_error_message,
 +                )
 +
-+            if error_message is not None and not isinstance(error_message, str):
-+                error_message = str(error_message)
-+
-+            # Downstream logic assumes a stable (success, error_message) shape.
-+            normalized_statuses.append((success, error_message))
-+
-+        all_success = all(success for success, _ in normalized_statuses)
-+        if all_success:
-+            return result
-+
-+        error_messages = [
-+            message
-+            for success, message in normalized_statuses
-+            if not success and message is not None
-+        ]
-+        merged_error_message = " | ".join(dict.fromkeys(error_messages))
-+        if not merged_error_message:
-+            merged_error_message = (
-+                "One or more tensor-parallel ranks failed while updating the LoRA adapter."
-+            )
-+
-+        return LoadLoRAAdapterFromTensorsReqOutput(
-+            success=False,
-+            error_message=merged_error_message,
++        merged_results = [merged_result]
++        torch.distributed.broadcast_object_list(
++            merged_results,
++            group=self.tp_cpu_group,
++            group_src=0,
 +        )
++        return merged_results[0]
 +
      def load_lora_adapter(
          self, recv_req: LoadLoRAAdapterReqInput
@@ -1727,7 +1736,7 @@ index a9ff0ac94..c124f43bc 100644
  
      def load_lora_adapter_from_tensors(
          self, recv_req: LoadLoRAAdapterFromTensorsReqInput
-     ) -> LoadLoRAAdapterFromTensorsReqOutput:
+@@ -2885,7 +2964,7 @@ class Scheduler(
          """In-place loading a new lora adapter from serialized tensors."""
  
          result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
@@ -1736,7 +1745,7 @@ index a9ff0ac94..c124f43bc 100644
  
      def unload_lora_adapter(
          self, recv_req: UnloadLoRAAdapterReqInput
-     ) -> UnloadLoRAAdapterReqOutput:
+@@ -2893,7 +2972,7 @@ class Scheduler(
          """Unload the lora adapter."""
  
          result = self.tp_worker.unload_lora_adapter(recv_req)
