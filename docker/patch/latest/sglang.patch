@@ -1672,9 +1672,9 @@ index a9ff0ac94..c124f43bc 100644
 +
 +        if not is_tp_root:
 +            return result
-+
-+        if all(success for success, _ in gathered_statuses):
-+            return result
++        else:
++            if all(success for success, _ in gathered_statuses):
++                return result
 +
 +        error_messages = [
 +            error_message
