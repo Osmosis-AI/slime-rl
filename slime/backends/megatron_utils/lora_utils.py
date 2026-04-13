@@ -153,6 +153,35 @@ def _resolve_base_model_name_or_path(args: Namespace) -> str | None:
     return hf_checkpoint
 
 
+def _read_hf_config_json(args: Namespace) -> dict[str, Any]:
+    """Best-effort load of the HF config JSON for the current checkpoint."""
+    hf_checkpoint = getattr(args, "hf_checkpoint", None)
+    if hf_checkpoint is None:
+        return {}
+
+    checkpoint_path = Path(hf_checkpoint)
+    if not checkpoint_path.is_dir():
+        return {}
+
+    config_path = checkpoint_path / "config.json"
+    if not config_path.exists():
+        return {}
+
+    try:
+        return json.loads(config_path.read_text())
+    except json.JSONDecodeError:
+        return {}
+
+
+def _read_hf_text_config_json(args: Namespace) -> dict[str, Any]:
+    """Return the text_config block if present, otherwise the top-level config."""
+    config_json = _read_hf_config_json(args)
+    text_config = config_json.get("text_config")
+    if isinstance(text_config, dict):
+        return text_config
+    return config_json
+
+
 def _resolve_modules_arg_to_hf(
     modules: str | Sequence[str] | None,
     *,
@@ -322,6 +351,16 @@ def resolve_target_modules_to_hf(args: Namespace) -> list[str]:
     return target_modules
 
 
+def resolve_target_modules_from_exported_weights(weight_names: Sequence[str]) -> list[str]:
+    """Infer canonical HF target modules from exported LoRA tensor names."""
+    discovered: list[str] = []
+    for module_name in _DEFAULT_HF_TARGET_MODULES:
+        needle = f".{module_name}."
+        if any(needle in weight_name for weight_name in weight_names):
+            discovered.append(module_name)
+    return discovered or list(_DEFAULT_HF_TARGET_MODULES)
+
+
 def resolve_exclude_modules_to_hf(args: Namespace) -> list[str] | None:
     """Resolve args.exclude_modules to canonical HF module names for PEFT metadata."""
     return _resolve_modules_arg_to_hf(
@@ -330,10 +369,14 @@ def resolve_exclude_modules_to_hf(args: Namespace) -> list[str] | None:
     )
 
 
-def build_lora_adapter_config(args: Namespace) -> dict[str, Any]:
+def build_lora_adapter_config(
+    args: Namespace,
+    *,
+    target_modules: Sequence[str] | None = None,
+) -> dict[str, Any]:
     """Build the shared PEFT-compatible adapter config for save and live sync."""
     base_model_name_or_path = _resolve_base_model_name_or_path(args)
-    target_modules = resolve_target_modules_to_hf(args)
+    target_modules = list(target_modules) if target_modules is not None else resolve_target_modules_to_hf(args)
     exclude_modules = resolve_exclude_modules_to_hf(args)
     revision = getattr(args, "revision", None)
 
@@ -356,6 +399,22 @@ def build_lora_adapter_config(args: Namespace) -> dict[str, Any]:
         config["revision"] = revision
 
     return config
+
+
+def _should_drop_from_external_lora_export(args: Namespace, hf_name: str) -> bool:
+    """Return True when a weight should be omitted from the external HF adapter export.
+
+    Stock upstream SGLang currently does not correctly serve Qwen3.5 MoE LoRA
+    weights on the ``shared_expert`` path. Keep the Megatron-native resume
+    checkpoint intact, but omit those tensors from the external HF adapter so
+    the saved artifact remains directly loadable by unmodified SGLang.
+    """
+    text_config = _read_hf_text_config_json(args)
+    model_type = text_config.get("model_type")
+    if model_type != "qwen3_5_moe_text":
+        return False
+
+    return ".mlp.shared_expert." in hf_name or ".mlp.shared_expert_gate." in hf_name
 
 
 def iter_exported_lora_weights(
@@ -454,14 +513,17 @@ def save_lora_checkpoint(
         logger.info(f"Saved {len(adapter_state)} adapter tensors (native) to {native_path}")
 
     # ---- HF PEFT format (uses the same export path as live SGLang sync) ----
-    lora_state_dict = {
-        hf_name: weight
-        for hf_name, weight in iter_exported_lora_weights(
-            args,
-            model,
-            cpu=True,
-        )
-    }
+    lora_state_dict: dict[str, torch.Tensor] = {}
+    dropped_hf_names: list[str] = []
+    for hf_name, weight in iter_exported_lora_weights(
+        args,
+        model,
+        cpu=True,
+    ):
+        if _should_drop_from_external_lora_export(args, hf_name):
+            dropped_hf_names.append(hf_name)
+            continue
+        lora_state_dict[hf_name] = weight
 
     # Only one rank writes the HF PEFT files (bridge already gathered across TP)
     if is_dp_rank_0 and tp_rank == 0:
@@ -471,10 +533,17 @@ def save_lora_checkpoint(
         torch.save(lora_state_dict, save_path / "adapter_model.bin")
         save_file(safetensors_state_dict, save_path / "adapter_model.safetensors")
 
+        exported_target_modules = resolve_target_modules_from_exported_weights(lora_state_dict.keys())
         with open(save_path / "adapter_config.json", "w") as f:
-            json.dump(build_lora_adapter_config(args), f, indent=2)
+            json.dump(build_lora_adapter_config(args, target_modules=exported_target_modules), f, indent=2)
 
         os.sync()
+        if dropped_hf_names:
+            logger.warning(
+                "Dropped %d unsupported HF adapter tensors from external export for stock SGLang compatibility: %s",
+                len(dropped_hf_names),
+                ", ".join(dropped_hf_names[:8]) + (" ..." if len(dropped_hf_names) > 8 else ""),
+            )
         logger.info(f"Saved HF PEFT adapter to {save_path} with {len(lora_state_dict)} tensors")
 
     # ---- Training state (optimizer + scheduler) for resume ----
@@ -595,4 +664,3 @@ def _load_training_state(
 # ---------------------------------------------------------------------------
 # LoRA config dict for weight sync to SGLang
 # ---------------------------------------------------------------------------
-

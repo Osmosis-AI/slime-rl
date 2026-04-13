@@ -72,6 +72,7 @@ Environment overrides:
   SLIME_RUNTIME_DIR  Clone destination inside the pod (default: /root/slime-rl-runtime)
   CHECKPOINT_DIR     Checkpoint root on the mounted Weka volume
   SAVE_INTERVAL      Save cadence in rollouts (default: 1)
+  TARGET_MODULES     LoRA target modules (default: q_proj,k_proj,v_proj,o_proj)
 EOF
 }
 
@@ -143,6 +144,7 @@ GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
 ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-10240}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
 EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-10240}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj}"
 
 MLFLOW_EXPERIMENT_NAME="${MLFLOW_EXPERIMENT_NAME:-slime-test-lora}"
 MLFLOW_RUN_NAME="${MLFLOW_RUN_NAME:-${JOB_NAME}}"
@@ -386,7 +388,7 @@ spec:
             --lora-rank 32 \
             --lora-alpha 32 \
             --lora-dropout 0.0 \
-            --target-modules "all-linear" \
+            --target-modules "${TARGET_MODULES}" \
             --save ${CHECKPOINT_DIR} \
             --save-interval ${SAVE_INTERVAL} \
             --prompt-data ${TRAIN_DATA} \
