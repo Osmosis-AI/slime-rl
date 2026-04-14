@@ -27,6 +27,7 @@ from slime.utils.processing_utils import (
     load_processor,
     load_tokenizer,
 )
+from slime.utils.trace_utils import build_sglang_meta_trace_attrs, trace_function, trace_span
 from slime.utils.types import Sample
 
 from .rm_hub import async_rm, batched_async_rm
@@ -34,6 +35,30 @@ from .rm_hub import async_rm, batched_async_rm
 __all__ = ["generate_rollout", "get_model_url"]
 
 logger = logging.getLogger(__name__)
+
+_PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
+
+
+def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
+    raw_multimodal_inputs = sample.multimodal_inputs or {}
+    has_multimodal_inputs = any(value is not None for value in raw_multimodal_inputs.values())
+    reuse_existing_input_ids = bool(sample.tokens) and (
+        sample.multimodal_train_inputs is not None or not has_multimodal_inputs
+    )
+
+    if processor and has_multimodal_inputs and not reuse_existing_input_ids:
+        processor_output = processor(text=sample.prompt, **build_processor_kwargs(raw_multimodal_inputs))
+        prompt_ids = processor_output["input_ids"][0]
+        if sample.multimodal_train_inputs is None:
+            sample.multimodal_train_inputs = {
+                k: v for k, v in processor_output.items() if k not in _PROCESSOR_PROMPT_KEYS
+            } or None
+        return prompt_ids
+
+    if reuse_existing_input_ids:
+        return sample.tokens
+
+    return tokenizer.encode(sample.prompt, add_special_tokens=False)
 
 
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
@@ -136,18 +161,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
     ), f"Sample status is {sample.status}"
 
-    if state.processor and sample.multimodal_inputs and any(v is not None for v in sample.multimodal_inputs.values()):
-        processor_kwargs = build_processor_kwargs(sample.multimodal_inputs)
-        processor_output = state.processor(text=sample.prompt, **processor_kwargs)
-        prompt_ids = processor_output["input_ids"][0]
-        sample.multimodal_train_inputs = {
-            k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
-        } or None
-    else:
-        prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
-
-    if len(sample.response) > 0:
-        sampling_params["max_new_tokens"] -= len(sample.tokens) - len(prompt_ids)
+    prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
 
     assert (
         sampling_params["max_new_tokens"] >= 0
@@ -170,24 +184,27 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
 
-    if sample.multimodal_inputs and sample.multimodal_inputs["images"]:
-        image_data = sample.multimodal_inputs["images"]
-        payload["image_data"] = [encode_image_for_rollout_engine(image) for image in image_data]
-
-    # Use existing tokens for multi-turn or tokenize the new prompt
-    if len(sample.response) > 0:
-        payload["input_ids"] = sample.tokens
+    images = sample.multimodal_inputs.get("images") if sample.multimodal_inputs else None
+    if images:
+        payload["image_data"] = [encode_image_for_rollout_engine(image) for image in images]
+        # For single-turn multimodal requests, send text so SGLang expands the
+        # image placeholders with its own processor rules.
+        payload["text"] = sample.prompt
     else:
         payload["input_ids"] = prompt_ids
-        if not sample.tokens:  # Initialize sample.tokens for the first turn
-            sample.tokens = prompt_ids
 
-    # Use session_id for consistent hashing routing if router uses consistent_hashing policy
+    if not sample.tokens:
+        sample.tokens = prompt_ids
+
+    # Use session_id for consistent hashing routing (SGLang Model Gateway)
     headers = None
-    if getattr(args, "router_policy", None) == "consistent_hashing" and sample.session_id:
-        headers = {"X-SMG-Routing-Key": sample.session_id}
+    if sample.session_id:
+        if getattr(args, "router_policy", None) == "consistent_hashing":
+            headers = {"X-SMG-Routing-Key": sample.session_id}
 
-    output = await post(url, payload, headers=headers)
+    with trace_span(sample, "sglang_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}) as span:
+        output = await post(url, payload, headers=headers)
+        span.update(build_sglang_meta_trace_attrs(output["meta_info"]))
 
     if "output_token_logprobs" in output["meta_info"]:
         new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -224,6 +241,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     return sample
 
 
+@trace_function("generate_and_rm", target="sample")
 async def generate_and_rm(
     args: Namespace,
     sample: Sample | list[Sample],
@@ -267,28 +285,33 @@ async def generate_and_rm(
     if args.group_rm:
         return sample
 
-    # multi samples
     if isinstance(sample, list):
         samples = sample
-        if any([sample.status == Sample.Status.ABORTED for sample in samples]):
+        if any(sample.status == Sample.Status.ABORTED for sample in samples):
             return samples
 
-        # for multi agent system, the reward of some sample is calculated during generation.
         samples_need_reward = [sample for sample in samples if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward)
+        with trace_span(samples_need_reward, "reward_model"):
+            rewards = await batched_async_rm(args, samples_need_reward)
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
         return samples
     else:
         if sample.status == Sample.Status.ABORTED:
             return sample
-        # for multi-turn environment, a reward could be assigned to the agent.
+        # Some custom generate paths may have already filled the reward.
         if sample.reward is None:
-            sample.reward = await async_rm(args, sample)
+            with trace_span(sample, "reward_model"):
+                sample.reward = await async_rm(args, sample)
 
     return sample
 
 
+@trace_function(
+    "generate_and_rm_group",
+    target="group",
+    attrs_getter=lambda args, group, sampling_params, evaluation=False: {"group_size": len(group)},
+)
 async def generate_and_rm_group(
     args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
 ) -> list[Sample]:
@@ -316,7 +339,8 @@ async def generate_and_rm_group(
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
-        rewards = await batched_async_rm(args, group)
+        with trace_span(group, "group_reward_model"):
+            rewards = await batched_async_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
 
@@ -607,5 +631,6 @@ def generate_rollout(
         return output
 
     output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_source.get_samples))
-    data_source.add_samples(aborted_samples)
+    if aborted_samples:
+        data_source.add_samples(aborted_samples)
     return output
