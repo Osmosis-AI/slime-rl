@@ -197,8 +197,13 @@ def _scope_bridge_target_modules(args: Namespace, target_modules: Sequence[str],
     Keep the external adapter clean by targeting only the text decoder modules we actually
     want to train and serve.
     """
+    config_json = _read_hf_config_json(args)
     text_config = _read_hf_text_config_json(args)
-    if text_config.get("model_type") != "qwen3_5_moe_text" or lora_type_name == "canonical_lora":
+    model_types = {
+        config_json.get("model_type"),
+        text_config.get("model_type"),
+    }
+    if model_types.isdisjoint({"qwen3_5_moe", "qwen3_5_moe_text"}) or lora_type_name == "canonical_lora":
         return list(target_modules)
 
     scoped_modules: list[str] = []
