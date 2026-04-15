@@ -3,7 +3,6 @@ from __future__ import annotations
 import inspect
 import types
 from argparse import Namespace
-
 import torch
 
 
@@ -67,6 +66,11 @@ def call_output_layer_linear(output_layer: torch.nn.Module, hidden_states: torch
         kwargs["weight"] = output_layer.weight
     if getattr(output_layer, _HAS_RUNTIME_GATHER_ATTR, False):
         kwargs["runtime_gather_output"] = False
+
+    # Hidden states may be fp32 (from Float16Module unwrap / grad accumulation)
+    # while output_layer weight is bf16. Cast to match.
+    if hasattr(output_layer, "weight") and output_layer.weight is not None:
+        hidden_states = hidden_states.to(output_layer.weight.dtype)
 
     output = original_forward(hidden_states, **kwargs)
     if isinstance(output, tuple):
