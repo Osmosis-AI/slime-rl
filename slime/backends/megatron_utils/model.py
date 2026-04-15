@@ -33,6 +33,23 @@ from .chunked_tp_logprob import (
     validate_chunked_tp_logprob_config,
 )
 from .data import DataIterator, get_batch
+
+
+def _find_output_layer(model_chunk: torch.nn.Module) -> torch.nn.Module | None:
+    """Find the output_layer on a (possibly VL-wrapped) model.
+
+    Tries the standard Megatron attribute traversal first; falls back to a
+    recursive search for VL models where output_layer sits inside a nested
+    language_model sub-module.
+    """
+    try:
+        return get_attr_wrapped_model(model_chunk, "output_layer", allow_none=True)
+    except RuntimeError:
+        pass
+    for m in model_chunk.modules():
+        if hasattr(m, "output_layer") and m.output_layer is not None:
+            return m.output_layer
+    return None
 from .lora_utils import is_lora_enabled, is_lora_model, save_lora_checkpoint
 from .loss import loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
@@ -123,7 +140,7 @@ def setup_model_and_optimizer(
         validate_chunked_tp_logprob_config(args)
         patched_output_layers = 0
         for model_chunk in _ensure_model_list(model):
-            output_layer = get_attr_wrapped_model(model_chunk, "output_layer", allow_none=True)
+            output_layer = _find_output_layer(model_chunk)
             if output_layer is None:
                 continue
             patched_output_layers += int(patch_output_layer_for_hidden_state_bypass(output_layer))
@@ -270,7 +287,7 @@ def forward_only(
             response_lengths=response_lengths,
             with_entropy=args.use_rollout_entropy,
             max_seq_lens=batch.get("max_seq_lens", None),
-            output_layer=getattr(model, "output_layer", None),
+            output_layer=_find_output_layer(model),
         )
 
     # Turn on evaluation mode which disables dropout.
@@ -447,7 +464,7 @@ def train_one_step(
             args,
             batch,
             num_microbatches,
-            output_layer=getattr(model, "output_layer", None),
+            output_layer=_find_output_layer(model),
         )
 
     # Forward pass.
