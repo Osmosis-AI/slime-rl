@@ -74,6 +74,12 @@ _MEGATRON_TO_HF_MODULES = {
 
 _DEFAULT_HF_TARGET_MODULES = list(_STANDARD_LORA_HF_TO_MEGATRON)
 _HF_MODULE_NAMES = set(_DEFAULT_HF_TARGET_MODULES)
+_QWEN35_TEXT_TARGET_PATTERNS = {
+    "linear_qkv": "language_model.decoder.layers.*.self_attention.linear_qkv",
+    "linear_proj": "language_model.decoder.layers.*.self_attention.linear_proj",
+    "linear_fc1": "language_model.decoder.layers.*.mlp.linear_fc1",
+    "linear_fc2": "language_model.decoder.layers.*.mlp.linear_fc2",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +186,28 @@ def _read_hf_text_config_json(args: Namespace) -> dict[str, Any]:
     if isinstance(text_config, dict):
         return text_config
     return config_json
+
+
+def _scope_bridge_target_modules(args: Namespace, target_modules: Sequence[str], *, lora_type_name: str) -> list[str]:
+    """Scope generic Megatron module names to the text decoder when the bridge model is multimodal.
+
+    Qwen3.5 MoE currently comes through Megatron-Bridge with both ``language_model`` and
+    ``vision_model`` trees. Generic targets like ``linear_qkv`` match both, which causes
+    LoRA to be attached to the vision stack and, for MLP targets, the shared-expert path.
+    Keep the external adapter clean by targeting only the text decoder modules we actually
+    want to train and serve.
+    """
+    text_config = _read_hf_text_config_json(args)
+    if text_config.get("model_type") != "qwen3_5_moe_text" or lora_type_name == "canonical_lora":
+        return list(target_modules)
+
+    scoped_modules: list[str] = []
+    for module in target_modules:
+        if "*" in module or "." in module:
+            scoped_modules.append(module)
+            continue
+        scoped_modules.append(_QWEN35_TEXT_TARGET_PATTERNS.get(module, module))
+    return _dedupe_preserve_order(scoped_modules)
 
 
 def _resolve_modules_arg_to_hf(
@@ -309,6 +337,7 @@ def create_lora_instance(args: Namespace):
         lora_cls = LoRA
 
     target_modules = _resolve_modules_arg_to_megatron(args.target_modules, lora_type=lora_cls)
+    target_modules = _scope_bridge_target_modules(args, target_modules, lora_type_name=lora_type_name)
     exclude_modules = _resolve_modules_arg_to_megatron(getattr(args, "exclude_modules", None), lora_type=lora_cls) or []
 
     lora = lora_cls(
@@ -399,28 +428,6 @@ def build_lora_adapter_config(
         config["revision"] = revision
 
     return config
-
-
-def _should_drop_from_external_lora_export(args: Namespace, hf_name: str) -> bool:
-    """Return True when a weight should be omitted from the external HF adapter export.
-
-    Stock upstream SGLang currently does not correctly serve Qwen3.5 MoE LoRA
-    weights on the ``shared_expert`` path. Keep the Megatron-native resume
-    checkpoint intact, but omit those tensors from the external HF adapter so
-    the saved artifact remains directly loadable by unmodified SGLang.
-    """
-    text_config = _read_hf_text_config_json(args)
-    model_type = text_config.get("model_type")
-    if model_type != "qwen3_5_moe_text":
-        return False
-
-    # The external adapter is a text-generation LoRA artifact. Vision-only LoRA
-    # tensors are ignored by SGLang's text path and do not match the saved PEFT
-    # metadata, so omit them from the exported inference adapter.
-    if hf_name.startswith("model.visual."):
-        return True
-
-    return ".mlp.shared_expert." in hf_name or ".mlp.shared_expert_gate." in hf_name
 
 
 def iter_exported_lora_weights(
@@ -520,15 +527,11 @@ def save_lora_checkpoint(
 
     # ---- HF PEFT format (uses the same export path as live SGLang sync) ----
     lora_state_dict: dict[str, torch.Tensor] = {}
-    dropped_hf_names: list[str] = []
     for hf_name, weight in iter_exported_lora_weights(
         args,
         model,
         cpu=True,
     ):
-        if _should_drop_from_external_lora_export(args, hf_name):
-            dropped_hf_names.append(hf_name)
-            continue
         lora_state_dict[hf_name] = weight
 
     # Only one rank writes the HF PEFT files (bridge already gathered across TP)
@@ -544,12 +547,6 @@ def save_lora_checkpoint(
             json.dump(build_lora_adapter_config(args, target_modules=exported_target_modules), f, indent=2)
 
         os.sync()
-        if dropped_hf_names:
-            logger.warning(
-                "Dropped %d unsupported HF adapter tensors from external export for stock SGLang compatibility: %s",
-                len(dropped_hf_names),
-                ", ".join(dropped_hf_names[:8]) + (" ..." if len(dropped_hf_names) > 8 else ""),
-            )
         logger.info(f"Saved HF PEFT adapter to {save_path} with {len(lora_state_dict)} tensors")
 
     # ---- Training state (optimizer + scheduler) for resume ----
