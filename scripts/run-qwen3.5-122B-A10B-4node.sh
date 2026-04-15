@@ -17,7 +17,9 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 NUM_NODES="${NUM_NODES:-4}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-1}"
-WORKING_DIR="${WORKING_DIR:-${ROOT_DIR}}"
+SLIME_REPO_URL="${SLIME_REPO_URL:-https://github.com/Osmosis-AI/slime-rl.git}"
+SLIME_REPO_BRANCH="${SLIME_REPO_BRANCH:-$(git -C "${ROOT_DIR}" branch --show-current)}"
+SLIME_RUNTIME_DIR="${SLIME_RUNTIME_DIR:-/root/slime-rl-runtime}"
 
 if [ -z "${MLP_WORKER_0_HOST}" ]; then
   echo "MLP_WORKER_0_HOST is not set."
@@ -61,8 +63,14 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/models/qwen3.5-122B-A10B.sh"
+command -v git >/dev/null 2>&1
+rm -rf "${SLIME_RUNTIME_DIR}"
+git clone --depth 1 --single-branch --branch "${SLIME_REPO_BRANCH}" "${SLIME_REPO_URL}" "${SLIME_RUNTIME_DIR}"
+cd "${SLIME_RUNTIME_DIR}"
+GIT_COMMIT=$(git rev-parse HEAD)
+echo "Using slime-rl repo ${SLIME_REPO_URL} branch ${SLIME_REPO_BRANCH} commit ${GIT_COMMIT}"
+
+source "${SLIME_RUNTIME_DIR}/scripts/models/qwen3.5-122B-A10B.sh"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}
@@ -193,6 +201,9 @@ for WORKER_IP in "${CLUSTER_HOSTS[@]}"; do
      ray stop --force 2>/dev/null || true; \
      pkill -9 ray 2>/dev/null || true; \
      pkill -9 -f 'train.py\\|train_async.py' 2>/dev/null || true; \
+     command -v git >/dev/null 2>&1; \
+     rm -rf ${SLIME_RUNTIME_DIR}; \
+     git clone --depth 1 --single-branch --branch ${SLIME_REPO_BRANCH} ${SLIME_REPO_URL} ${SLIME_RUNTIME_DIR}; \
      ray start --address=${MASTER_ADDR}:${RAY_PORT} --num-gpus ${GPUS_PER_NODE} --node-ip-address ${WORKER_IP} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=${RAY_DASHBOARD_PORT}" &
   STARTED_NODES=$((STARTED_NODES + 1))
   if [ "${STARTED_NODES}" -ge "${NUM_NODES}" ]; then
@@ -224,7 +235,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF
     "GLOO_SOCKET_IFNAME": "${MLP_SOCKET_IFNAME}",
     "TP_SOCKET_IFNAME": "${MLP_SOCKET_IFNAME}",
     "MASTER_ADDR": "${MASTER_ADDR}",
-    "PYTHONPATH": "${MEGATRON_LM_DIR}",
+    "PYTHONPATH": "${SLIME_RUNTIME_DIR}:${MEGATRON_LM_DIR}",
     "NCCL_CUMEM_ENABLE": "0",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "NVTE_BWD_LAYERNORM_SM_MARGIN": "20",
@@ -246,16 +257,17 @@ RUNTIME_ENV_JSON=$(cat <<EOF
     "OMPI_MCA_routed_radix": "1024",
     "OMPI_MCA_plm_rsh_no_tree_spawn": "1",
     "OMPI_MCA_oob_tcp_if_include": "${MLP_SOCKET_IFNAME}",
-    "OMPI_MCA_btl_tcp_if_include": "${MLP_SOCKET_IFNAME}"
+    "OMPI_MCA_btl_tcp_if_include": "${MLP_SOCKET_IFNAME}",
+    "SLIME_REPO_URL": "${SLIME_REPO_URL}",
+    "SLIME_REPO_BRANCH": "${SLIME_REPO_BRANCH}"
   }
 }
 EOF
 )
 
 ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
-   --working-dir="${WORKING_DIR}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 train.py \
+   -- python3 ${SLIME_RUNTIME_DIR}/train.py \
    --actor-num-nodes ${NUM_NODES} \
    --actor-num-gpus-per-node ${GPUS_PER_NODE} \
    --colocate \
