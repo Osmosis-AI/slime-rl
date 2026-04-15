@@ -1642,27 +1642,25 @@ index a9ff0ac94..c124f43bc 100644
                  (GetWeightsByNameReqInput, self.get_weights_by_name),
                  (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
                  (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
-@@ -2871,13 +2871,59 @@ class Scheduler(
+@@ -2871,13 +2871,52 @@ class Scheduler(
      def continue_generation(self, recv_req: ContinueGenerationReqInput):
          self._engine_paused = False
  
-+    def _sync_lora_update_result(
-+        self, result: LoadLoRAAdapterFromTensorsReqOutput
-+    ) -> LoadLoRAAdapterFromTensorsReqOutput:
++    def _sync_lora_update_result(self, result):
 +        """Wait for all TP ranks to finish a LoRA update and merge failures on TP0."""
 +
-+        if not (
-+            torch.distributed.is_available() and torch.distributed.is_initialized()
-+        ):
++        if not torch.distributed.is_initialized():
 +            return result
 +
 +        tp_world_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
 +        if tp_world_size <= 1:
 +            return result
 +
-+        is_tp_root = torch.distributed.get_rank(group=self.tp_cpu_group) == 0
-+
-+        gathered_statuses = [None] * tp_world_size if is_tp_root else None
++        gathered_statuses = (
++            [None] * tp_world_size
++            if torch.distributed.get_rank(group=self.tp_cpu_group) == 0
++            else None
++        )
 +        torch.distributed.gather_object(
 +            (result.success, result.error_message),
 +            object_gather_list=gathered_statuses,
@@ -1670,26 +1668,21 @@ index a9ff0ac94..c124f43bc 100644
 +            group_dst=0,
 +        )
 +
-+        if not is_tp_root:
++        if gathered_statuses is None:
 +            return result
-+        else:
-+            if all(success for success, _ in gathered_statuses):
-+                return result
++
++        if all(success for success, _ in gathered_statuses):
++            return result
 +
 +        error_messages = [
 +            error_message
 +            for success, error_message in gathered_statuses
-+            if not success and error_message is not None
++            if not success and error_message
 +        ]
-+        merged_error_message = " | ".join(dict.fromkeys(error_messages))
-+        if not merged_error_message:
-+            merged_error_message = (
-+                "One or more tensor-parallel ranks failed while updating the LoRA adapter, gathered statuses for all TP workers: " + str(gathered_statuses)
-+            )
-+
-+        return LoadLoRAAdapterFromTensorsReqOutput(
++        return type(result)(
 +            success=False,
-+            error_message=merged_error_message,
++            error_message=" | ".join(dict.fromkeys(error_messages))
++            or "LoRA update failed on one or more tensor-parallel ranks.",
 +        )
 +
      def load_lora_adapter(
@@ -3498,7 +3491,7 @@ index d969dc8ca..9f64fdb4d 100644
 diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
 --- a/python/sglang/srt/lora/mem_pool.py
 +++ b/python/sglang/srt/lora/mem_pool.py
-@@ -414,6 +414,56 @@
+@@ -414,6 +414,54 @@
                  ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
                  buffer_view.copy_(weight, non_blocking=True)
  
@@ -3513,20 +3506,19 @@ diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_poo
 +                or target_module not in ROW_PARALLELISM_LINEAR_LORA_NAMES
 +                or weight.ndim != 2
 +                or buffer_view.ndim != 2
-+                or weight.shape == buffer_view.shape
 +            ):
 +                return weight
 +
-+            if weight.shape[0] != buffer_view.shape[0]:
-+                return weight
++            if weight.shape == (
++                buffer_view.shape[0],
++                buffer_view.shape[1] * self.tp_size,
++            ):
++                shard_size = buffer_view.shape[1]
++                start_idx = self.tp_rank * shard_size
++                end_idx = start_idx + shard_size
++                return weight[:, start_idx:end_idx].contiguous()
 +
-+            if weight.shape[1] != buffer_view.shape[1] * self.tp_size:
-+                return weight
-+
-+            shard_size = buffer_view.shape[1]
-+            start_idx = self.tp_rank * shard_size
-+            end_idx = start_idx + shard_size
-+            return weight[:, start_idx:end_idx].contiguous()
++            return weight
 +
 +        def adapt_column_parallel_lora_b_weight_for_tp_buffer(
 +            buffer_view: torch.Tensor,
@@ -3537,20 +3529,19 @@ diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_poo
 +                or weight is None
 +                or weight.ndim != 2
 +                or buffer_view.ndim != 2
-+                or weight.shape == buffer_view.shape
 +            ):
 +                return weight
 +
-+            if weight.shape[1] != buffer_view.shape[1]:
-+                return weight
++            if weight.shape == (
++                buffer_view.shape[0] * self.tp_size,
++                buffer_view.shape[1],
++            ):
++                shard_size = buffer_view.shape[0]
++                start_idx = self.tp_rank * shard_size
++                end_idx = start_idx + shard_size
++                return weight[start_idx:end_idx, :].contiguous()
 +
-+            if weight.shape[0] != buffer_view.shape[0] * self.tp_size:
-+                return weight
-+
-+            shard_size = buffer_view.shape[0]
-+            start_idx = self.tp_rank * shard_size
-+            end_idx = start_idx + shard_size
-+            return weight[start_idx:end_idx, :].contiguous()
++            return weight
 +
          if uid is None:
              for i in range(self.num_layer):
