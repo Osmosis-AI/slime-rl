@@ -19,7 +19,7 @@ GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-1}"
 SLIME_REPO_URL="${SLIME_REPO_URL:-https://github.com/Osmosis-AI/slime-rl.git}"
 SLIME_REPO_BRANCH="${SLIME_REPO_BRANCH:-$(git -C "${ROOT_DIR}" branch --show-current)}"
-SLIME_RUNTIME_DIR="${SLIME_RUNTIME_DIR:-/root/slime-rl-runtime}"
+SLIME_RUNTIME_DIR="${SLIME_RUNTIME_DIR:-/root/slime}"
 
 if [ -z "${MLP_WORKER_0_HOST}" ]; then
   echo "MLP_WORKER_0_HOST is not set."
@@ -64,8 +64,14 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 command -v git >/dev/null 2>&1
-rm -rf "${SLIME_RUNTIME_DIR}"
-git clone --depth 1 --single-branch --branch "${SLIME_REPO_BRANCH}" "${SLIME_REPO_URL}" "${SLIME_RUNTIME_DIR}"
+if [ -d "${SLIME_RUNTIME_DIR}/.git" ]; then
+  git -C "${SLIME_RUNTIME_DIR}" fetch origin "${SLIME_REPO_BRANCH}"
+  git -C "${SLIME_RUNTIME_DIR}" checkout -B "${SLIME_REPO_BRANCH}" "origin/${SLIME_REPO_BRANCH}"
+  git -C "${SLIME_RUNTIME_DIR}" reset --hard "origin/${SLIME_REPO_BRANCH}"
+else
+  rm -rf "${SLIME_RUNTIME_DIR}"
+  git clone --depth 1 --single-branch --branch "${SLIME_REPO_BRANCH}" "${SLIME_REPO_URL}" "${SLIME_RUNTIME_DIR}"
+fi
 cd "${SLIME_RUNTIME_DIR}"
 GIT_COMMIT=$(git rev-parse HEAD)
 echo "Using slime-rl repo ${SLIME_REPO_URL} branch ${SLIME_REPO_BRANCH} commit ${GIT_COMMIT}"
@@ -202,8 +208,14 @@ for WORKER_IP in "${CLUSTER_HOSTS[@]}"; do
      pkill -9 ray 2>/dev/null || true; \
      pkill -9 -f 'train.py\\|train_async.py' 2>/dev/null || true; \
      command -v git >/dev/null 2>&1; \
-     rm -rf ${SLIME_RUNTIME_DIR}; \
-     git clone --depth 1 --single-branch --branch ${SLIME_REPO_BRANCH} ${SLIME_REPO_URL} ${SLIME_RUNTIME_DIR}; \
+     if [ -d ${SLIME_RUNTIME_DIR}/.git ]; then \
+       git -C ${SLIME_RUNTIME_DIR} fetch origin ${SLIME_REPO_BRANCH}; \
+       git -C ${SLIME_RUNTIME_DIR} checkout -B ${SLIME_REPO_BRANCH} origin/${SLIME_REPO_BRANCH}; \
+       git -C ${SLIME_RUNTIME_DIR} reset --hard origin/${SLIME_REPO_BRANCH}; \
+     else \
+       rm -rf ${SLIME_RUNTIME_DIR}; \
+       git clone --depth 1 --single-branch --branch ${SLIME_REPO_BRANCH} ${SLIME_REPO_URL} ${SLIME_RUNTIME_DIR}; \
+     fi; \
      ray start --address=${MASTER_ADDR}:${RAY_PORT} --num-gpus ${GPUS_PER_NODE} --node-ip-address ${WORKER_IP} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=${RAY_DASHBOARD_PORT}" &
   STARTED_NODES=$((STARTED_NODES + 1))
   if [ "${STARTED_NODES}" -ge "${NUM_NODES}" ]; then
