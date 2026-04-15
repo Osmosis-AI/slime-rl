@@ -249,6 +249,7 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
     provider.sequence_parallel = args.sequence_parallel
     provider.virtual_pipeline_model_parallel_size = args.virtual_pipeline_model_parallel_size
     provider.context_parallel_size = args.context_parallel_size
+    provider.calculate_per_token_loss = args.calculate_per_token_loss
     provider.variable_seq_lengths = True
     provider.moe_token_dispatcher_type = "alltoall"
     provider.moe_router_load_balancing_type = "none"
