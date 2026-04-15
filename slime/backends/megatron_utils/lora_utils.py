@@ -414,6 +414,12 @@ def _should_drop_from_external_lora_export(args: Namespace, hf_name: str) -> boo
     if model_type != "qwen3_5_moe_text":
         return False
 
+    # The external adapter is a text-generation LoRA artifact. Vision-only LoRA
+    # tensors are ignored by SGLang's text path and do not match the saved PEFT
+    # metadata, so omit them from the exported inference adapter.
+    if hf_name.startswith("model.visual."):
+        return True
+
     return ".mlp.shared_expert." in hf_name or ".mlp.shared_expert_gate." in hf_name
 
 

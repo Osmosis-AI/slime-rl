@@ -3473,3 +3473,24 @@ index 3be16446e..1b2371c83 100644
          assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
          assert (
              expect_should_compare == actual_should_compare
+diff --git a/python/sglang/srt/lora/utils.py b/python/sglang/srt/lora/utils.py
+index d969dc8ca..9f64fdb4d 100644
+--- a/python/sglang/srt/lora/utils.py
++++ b/python/sglang/srt/lora/utils.py
+@@ -74,8 +74,13 @@ def get_hidden_dim(
+         """
+         head_dim = getattr(
+             config, "head_dim", config.hidden_size // config.num_attention_heads
+         )
+         if module_name == "qkv_proj":
++            # Qwen3.5 folds an additional attention-output-gate branch into the
++            # query projection. When enabled, the q projection contributes 2x the
++            # usual attention head width to qkv_proj's output dimension.
++            q_proj_multiplier = 2 if getattr(config, "attn_output_gate", False) else 1
+             return config.hidden_size, head_dim * (
+-                config.num_attention_heads + config.num_key_value_heads * 2
++                config.num_attention_heads * q_proj_multiplier
++                + config.num_key_value_heads * 2
+             )
+         elif module_name == "o_proj":
+             o_head_dim = getattr(config, "v_head_dim", None) or head_dim
