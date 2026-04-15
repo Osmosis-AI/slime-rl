@@ -3494,3 +3494,89 @@ index d969dc8ca..9f64fdb4d 100644
              )
          elif module_name == "o_proj":
              o_head_dim = getattr(config, "v_head_dim", None) or head_dim
+
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -414,6 +414,56 @@
+                 ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                 buffer_view.copy_(weight, non_blocking=True)
+ 
++        def adapt_row_parallel_lora_a_weight_for_tp_buffer(
++            target_module: str,
++            buffer_view: torch.Tensor,
++            weight: Optional[torch.Tensor],
++        ) -> Optional[torch.Tensor]:
++            if (
++                self.tp_size <= 1
++                or weight is None
++                or target_module not in ROW_PARALLELISM_LINEAR_LORA_NAMES
++                or weight.ndim != 2
++                or buffer_view.ndim != 2
++                or weight.shape == buffer_view.shape
++            ):
++                return weight
++
++            if weight.shape[0] != buffer_view.shape[0]:
++                return weight
++
++            if weight.shape[1] != buffer_view.shape[1] * self.tp_size:
++                return weight
++
++            shard_size = buffer_view.shape[1]
++            start_idx = self.tp_rank * shard_size
++            end_idx = start_idx + shard_size
++            return weight[:, start_idx:end_idx].contiguous()
++
++        def adapt_column_parallel_lora_b_weight_for_tp_buffer(
++            buffer_view: torch.Tensor,
++            weight: Optional[torch.Tensor],
++        ) -> Optional[torch.Tensor]:
++            if (
++                self.tp_size <= 1
++                or weight is None
++                or weight.ndim != 2
++                or buffer_view.ndim != 2
++                or weight.shape == buffer_view.shape
++            ):
++                return weight
++
++            if weight.shape[1] != buffer_view.shape[1]:
++                return weight
++
++            if weight.shape[0] != buffer_view.shape[0] * self.tp_size:
++                return weight
++
++            shard_size = buffer_view.shape[0]
++            start_idx = self.tp_rank * shard_size
++            end_idx = start_idx + shard_size
++            return weight[start_idx:end_idx, :].contiguous()
++
+         if uid is None:
+             for i in range(self.num_layer):
+                 for k in self.A_buffer.keys():
+@@ -462,14 +512,24 @@
+                     )
+ 
+             for name, weights in temp_A_buffer.items():
++                if weights is None:
++                    continue
+                 c = get_stacked_multiply(name)
+                 target_buffer = self.A_buffer[name][layer_id]
+                 buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
++                weights = adapt_row_parallel_lora_a_weight_for_tp_buffer(
++                    name, buffer_view, weights
++                )
+                 load_lora_weight_tensor(buffer_view, weights)
+ 
+             for name, weights in temp_B_buffer.items():
++                if weights is None:
++                    continue
+                 target_buffer = self.B_buffer[name][layer_id]
+                 buffer_view = target_buffer[buffer_id, :, :lora_rank]
++                weights = adapt_column_parallel_lora_b_weight_for_tp_buffer(
++                    buffer_view, weights
++                )
+                 load_lora_weight_tensor(buffer_view, weights)
+ 
+         if lora_adapter.embedding_layers:
