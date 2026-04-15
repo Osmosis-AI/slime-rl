@@ -4,6 +4,8 @@ import inspect
 import types
 from argparse import Namespace
 import torch
+import torch.nn.functional as F
+from megatron.core import tensor_parallel
 
 
 _BYPASS_ENABLED_ATTR = "_slime_chunked_tp_logprob_enabled"
@@ -59,6 +61,28 @@ def patch_output_layer_for_hidden_state_bypass(output_layer: torch.nn.Module) ->
     return True
 
 
+def gather_hidden_states_for_output_layer(
+    hidden_states: torch.Tensor,
+    output_layer: torch.nn.Module,
+) -> torch.Tensor:
+    if not getattr(output_layer, "sequence_parallel", False):
+        return hidden_states
+    if hidden_states.dim() != 3:
+        raise ValueError(
+            "Chunked TP logprob expects 3D hidden states before sequence-parallel gather. "
+            f"Got: {tuple(hidden_states.shape)}"
+        )
+
+    # Megatron sequence-parallel collectives operate on the leading dimension,
+    # so transpose bshd -> sbhd, gather, then restore the original layout.
+    hidden_states = hidden_states.transpose(0, 1).contiguous()
+    hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+        hidden_states,
+        tensor_parallel_output_grad=False,
+    )
+    return hidden_states.transpose(0, 1).contiguous()
+
+
 def call_output_layer_linear(output_layer: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
     original_forward = getattr(output_layer, _ORIGINAL_FORWARD_ATTR, output_layer.forward)
     kwargs = {}
@@ -71,6 +95,16 @@ def call_output_layer_linear(output_layer: torch.nn.Module, hidden_states: torch
     # while output_layer weight is bf16. Cast to match.
     if hasattr(output_layer, "weight") and output_layer.weight is not None:
         hidden_states = hidden_states.to(output_layer.weight.dtype)
+
+    # Replay only the local vocab projection here. The chunked path gathers
+    # hidden states explicitly when sequence parallel is enabled, so letting the
+    # output layer forward all-gather sequence again would double the row count
+    # and break token alignment.
+    if getattr(output_layer, "sequence_parallel", False):
+        if not hasattr(output_layer, "weight") or output_layer.weight is None:
+            raise ValueError("Sequence-parallel chunked TP logprob replay requires output_layer.weight.")
+        output = F.linear(hidden_states, output_layer.weight, getattr(output_layer, "bias", None))
+        return output.float()
 
     output = original_forward(hidden_states, **kwargs)
     if isinstance(output, tuple):

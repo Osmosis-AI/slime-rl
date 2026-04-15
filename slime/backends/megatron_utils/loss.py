@@ -24,7 +24,11 @@ from slime.utils.ppo_utils import (
 )
 from slime.utils.types import RolloutBatch
 
-from .chunked_tp_logprob import call_output_layer_linear, output_layer_uses_hidden_state_bypass
+from .chunked_tp_logprob import (
+    call_output_layer_linear,
+    gather_hidden_states_for_output_layer,
+    output_layer_uses_hidden_state_bypass,
+)
 from .cp_utils import (
     all_gather_with_cp,
     get_logits_and_tokens_offset_with_cp,
@@ -381,6 +385,7 @@ def _extract_per_sample(
     return log_probs_list, entropy_list
 
 
+@torch._dynamo.disable()
 def _get_log_probs_and_entropy_from_hidden_states(
     hidden_states: torch.Tensor,
     *,
@@ -398,6 +403,7 @@ def _get_log_probs_and_entropy_from_hidden_states(
     assert max_seq_lens is not None
     assert len(hidden_states.shape) == 3, f"{hidden_states.shape}"
 
+    hidden_states = gather_hidden_states_for_output_layer(hidden_states, output_layer)
     hidden_states = hidden_states.contiguous().view(-1, hidden_states.size(-1))
     hidden_states = hidden_states.contiguous()
     T = hidden_states.size(0)
