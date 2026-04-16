@@ -8,7 +8,7 @@
 #
 # Usage:
 #   bash scripts/benchmark/bench_chunked_tp_logprob_35b.sh
-#   NUM_ROLLOUT=20 MAX_TRAINING_STEPS=5 bash scripts/benchmark/bench_chunked_tp_logprob_35b.sh
+#   NUM_ROLLOUT=20 bash scripts/benchmark/bench_chunked_tp_logprob_35b.sh
 #   RUN_FUSED_SELECTED_VARIANT=1 bash scripts/benchmark/bench_chunked_tp_logprob_35b.sh
 #
 # Compare:
@@ -19,9 +19,9 @@
 set -euo pipefail
 set -x
 
-NUM_ROLLOUT="${NUM_ROLLOUT:-40}"
-MAX_TRAINING_STEPS="${MAX_TRAINING_STEPS:-6}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-10}"       # 1 rollout = 1 training step (128 samples / GBS 128)
 CHUNK_SIZES="${CHUNK_SIZES:-512}"       # space-separated list, e.g. "512 256 128"
+ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-12288}"
 PROFILE_TARGET="${PROFILE_TARGET:-}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 RUN_FUSED_SELECTED_VARIANT="${RUN_FUSED_SELECTED_VARIANT:-0}"
@@ -85,7 +85,7 @@ ROLLOUT_ARGS=(
    --num-rollout "${NUM_ROLLOUT}"
    --rollout-batch-size 16
    --n-samples-per-prompt 8
-   --rollout-max-response-len 1024
+   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
    --rollout-temperature 1
    --global-batch-size 128
 )
@@ -143,7 +143,6 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    --attention-backend flash
    --moe-token-dispatcher-type alltoall
-   --max-training-steps "${MAX_TRAINING_STEPS}"
 )
 
 PROFILE_ARGS=()

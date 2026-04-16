@@ -6,15 +6,14 @@
 #
 # Usage:
 #   bash scripts/benchmark/bench_chunked_tp_logprob_122b.sh
-#   NUM_ROLLOUT=10 MAX_TRAINING_STEPS=5 bash scripts/benchmark/bench_chunked_tp_logprob_122b.sh
+#   NUM_ROLLOUT=5 bash scripts/benchmark/bench_chunked_tp_logprob_122b.sh
 #   ROLLOUT_MAX_RESPONSE_LEN=16384 RUN_FUSED_SELECTED_VARIANT=1 bash scripts/benchmark/bench_chunked_tp_logprob_122b.sh
 
 set -euo pipefail
 set -x
 
-NUM_ROLLOUT="${NUM_ROLLOUT:-10}"
-MAX_TRAINING_STEPS="${MAX_TRAINING_STEPS:-10}"
-CHUNK_SIZES="${CHUNK_SIZES:-512}"      
+NUM_ROLLOUT="${NUM_ROLLOUT:-10}"       # 1 rollout = 1 training step (32 samples / GBS 32)
+CHUNK_SIZES="${CHUNK_SIZES:-512}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-4096}"
 RUN_FUSED_SELECTED_VARIANT="${RUN_FUSED_SELECTED_VARIANT:-0}"
@@ -141,7 +140,6 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    --attention-backend flash
    --moe-token-dispatcher-type alltoall
-   --max-training-steps "${MAX_TRAINING_STEPS}"
 )
 
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
