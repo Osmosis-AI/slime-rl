@@ -14,7 +14,7 @@ set -x
 
 NUM_ROLLOUT="${NUM_ROLLOUT:-10}"
 MAX_TRAINING_STEPS="${MAX_TRAINING_STEPS:-10}"
-SEQ_CHUNK_SIZE="${SEQ_CHUNK_SIZE:-512}"
+CHUNK_SIZES="${CHUNK_SIZES:-512}"      
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-4096}"
 RUN_FUSED_SELECTED_VARIANT="${RUN_FUSED_SELECTED_VARIANT:-0}"
@@ -199,30 +199,35 @@ run_variant "baseline" \
     --mlflow-run-name "122b-baseline-${ROLLOUT_MAX_RESPONSE_LEN}-lora" \
     --log-probs-chunk-size 4096
 
-run_variant "chunked_seq${SEQ_CHUNK_SIZE}" \
-    --mlflow-run-name "122b-chunked-${ROLLOUT_MAX_RESPONSE_LEN}-lora" \
-    --use-chunked-tp-logprob-loss \
-    --chunked-tp-logprob-seq-chunk-size "${SEQ_CHUNK_SIZE}"
-if [ "${RUN_FUSED_SELECTED_VARIANT}" = "1" ]; then
-    run_variant "fused_seq${SEQ_CHUNK_SIZE}" \
-        --mlflow-run-name "122b-fused-${ROLLOUT_MAX_RESPONSE_LEN}-lora" \
+for cs in ${CHUNK_SIZES}; do
+    run_variant "chunked_seq${cs}" \
+        --mlflow-run-name "122b-chunked${cs}-${ROLLOUT_MAX_RESPONSE_LEN}-lora" \
         --use-chunked-tp-logprob-loss \
-        --chunked-tp-logprob-seq-chunk-size "${SEQ_CHUNK_SIZE}" \
-        --use-fused-selected-tp-logprob
-fi
+        --chunked-tp-logprob-seq-chunk-size "${cs}"
+    if [ "${RUN_FUSED_SELECTED_VARIANT}" = "1" ]; then
+        run_variant "fused_seq${cs}" \
+            --mlflow-run-name "122b-fused${cs}-${ROLLOUT_MAX_RESPONSE_LEN}-lora" \
+            --use-chunked-tp-logprob-loss \
+            --chunked-tp-logprob-seq-chunk-size "${cs}" \
+            --use-fused-selected-tp-logprob
+    fi
+done
 
 echo ""
 echo "========================================"
 echo "  Results Summary"
 echo "========================================"
 
-for label in baseline "chunked_seq${SEQ_CHUNK_SIZE}"; do
+ALL_LABELS="baseline"
+for cs in ${CHUNK_SIZES}; do
+    ALL_LABELS="${ALL_LABELS} chunked_seq${cs}"
+    if [ "${RUN_FUSED_SELECTED_VARIANT}" = "1" ]; then
+        ALL_LABELS="${ALL_LABELS} fused_seq${cs}"
+    fi
+done
+
+for label in ${ALL_LABELS}; do
     echo ""
     echo "--- ${label} ---"
     grep -E "actor_train_time|log_probs_time|train_wait_time|sleep_time|wake_up_time|update_weights_time|tflops|peak_gb|tok_per_s" "/tmp/bench_chunked_tp_122b_${label}.log" || true
 done
-if [ "${RUN_FUSED_SELECTED_VARIANT}" = "1" ]; then
-    echo ""
-    echo "--- fused_seq${SEQ_CHUNK_SIZE} ---"
-    grep -E "actor_train_time|log_probs_time|train_wait_time|sleep_time|wake_up_time|update_weights_time|tflops|peak_gb|tok_per_s" "/tmp/bench_chunked_tp_122b_fused_seq${SEQ_CHUNK_SIZE}.log" || true
-fi
