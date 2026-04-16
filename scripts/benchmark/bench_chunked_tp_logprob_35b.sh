@@ -202,7 +202,9 @@ run_variant() {
     sleep 5
 }
 
-run_variant "baseline"
+if [ "${SKIP_BASELINE:-0}" != "1" ]; then
+    run_variant "baseline"
+fi
 
 for cs in ${CHUNK_SIZES}; do
     run_variant "chunked_seq${cs}" \

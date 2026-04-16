@@ -195,9 +195,11 @@ run_variant() {
     sleep 5
 }
 
-run_variant "baseline" \
-    --mlflow-run-name "122b-baseline-${ROLLOUT_MAX_RESPONSE_LEN}-lora" \
-    --log-probs-chunk-size 4096
+if [ "${SKIP_BASELINE:-0}" != "1" ]; then
+    run_variant "baseline" \
+        --mlflow-run-name "122b-baseline-${ROLLOUT_MAX_RESPONSE_LEN}-lora" \
+        --log-probs-chunk-size 4096
+fi
 
 for cs in ${CHUNK_SIZES}; do
     run_variant "chunked_seq${cs}" \
