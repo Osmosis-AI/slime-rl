@@ -288,20 +288,38 @@ class SGLangEngine(RayActor):
         """Flush the cache of the server."""
         if self.node_rank != 0:
             return
-        # flush cache will not return status_code 200 when there are pending requests
-        for _ in range(60):
+        # Pass timeout=300 so sglang waits up to 5 minutes for in-flight requests
+        # to complete before flushing. This handles "ghost" streaming requests
+        # left behind when Daytona sandboxes are torn down mid-generation.
+        # Retry the whole thing up to 3 times in case sglang hits its own timeout.
+        last_err = None
+        for attempt in range(3):
             try:
-                response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
+                response = requests.get(
+                    f"http://{self.server_host}:{self.server_port}/flush_cache?timeout=300",
+                    timeout=600,
+                )
                 if response.status_code == 200:
-                    break
+                    return
+                last_err = f"HTTP {response.status_code}: {response.text[:200]}"
+                logger.warning(f"flush_cache attempt {attempt+1}/3 failed: {last_err}")
+                # Between retries, try to proactively abort any remaining requests
+                try:
+                    requests.post(
+                        f"http://{self.server_host}:{self.server_port}/abort_request",
+                        json={"abort_all": True},
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
+                time.sleep(5)
             except NewConnectionError as e:
                 raise e
             except Exception as e:
-                logger.info(f"Error flushing cache: {e}")
-                time.sleep(1)
-                continue
-        else:
-            raise TimeoutError("Timeout while flushing cache.")
+                last_err = str(e)
+                logger.info(f"Error flushing cache (attempt {attempt+1}/3): {e}")
+                time.sleep(5)
+        raise TimeoutError(f"Timeout while flushing cache. Last error: {last_err}")
 
     def get_url(self):
         if self.node_rank != 0:
