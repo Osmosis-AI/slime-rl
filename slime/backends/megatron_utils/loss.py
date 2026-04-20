@@ -1,3 +1,4 @@
+import inspect
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -23,6 +24,11 @@ from slime.utils.ppo_utils import (
 )
 from slime.utils.types import RolloutBatch
 
+from .chunked_tp_logprob import (
+    call_output_layer_linear,
+    gather_hidden_states_for_output_layer,
+    output_layer_uses_hidden_state_bypass,
+)
 from .cp_utils import (
     all_gather_with_cp,
     get_logits_and_tokens_offset_with_cp,
@@ -379,6 +385,99 @@ def _extract_per_sample(
     return log_probs_list, entropy_list
 
 
+@torch._dynamo.disable()
+def _get_log_probs_and_entropy_from_hidden_states(
+    hidden_states: torch.Tensor,
+    *,
+    output_layer: torch.nn.Module,
+    args: Namespace,
+    unconcat_tokens: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+    with_entropy: bool = False,
+    max_seq_lens: list[int] | None = None,
+) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
+    qkv_format = args.qkv_format
+
+    assert qkv_format == "bshd", f"{qkv_format}"
+    assert max_seq_lens is not None
+    assert len(hidden_states.shape) == 3, f"{hidden_states.shape}"
+
+    hidden_states = gather_hidden_states_for_output_layer(hidden_states, output_layer)
+    hidden_states = hidden_states.contiguous().view(-1, hidden_states.size(-1))
+    hidden_states = hidden_states.contiguous()
+    T = hidden_states.size(0)
+    device = hidden_states.device
+    tp_group = mpu.get_tensor_model_parallel_group()
+    seq_chunk_size = args.chunked_tp_logprob_seq_chunk_size
+    need_entropy_grad = with_entropy and args.entropy_coef != 0
+
+    full_tokens = _build_shifted_tokens(
+        T,
+        device,
+        unconcat_tokens,
+        total_lengths,
+        response_lengths,
+        qkv_format,
+        max_seq_lens,
+        args.allgather_cp,
+    )
+
+    log_prob_chunks: list[torch.Tensor] = []
+    entropy_chunks: list[torch.Tensor] = []
+    rollout_temperature = getattr(args, "rollout_temperature", 1.0)
+
+    for start in range(0, T, seq_chunk_size):
+        end = min(start + seq_chunk_size, T)
+        hidden_chunk = hidden_states[start:end]
+        logits_chunk = call_output_layer_linear(output_layer, hidden_chunk)
+        logits_chunk = logits_chunk.float().contiguous()
+        if logits_chunk.dim() != 2:
+            logits_chunk = logits_chunk.view(-1, logits_chunk.size(-1))
+        if rollout_temperature != 1.0:
+            logits_chunk = logits_chunk / rollout_temperature
+
+        log_prob_chunk, entropy_chunk = calculate_log_probs_and_entropy(
+            logits_chunk,
+            full_tokens[start:end],
+            tp_group,
+            with_entropy=with_entropy,
+            chunk_size=-1,
+            need_entropy_grad=need_entropy_grad,
+        )
+        log_prob_chunks.append(log_prob_chunk.reshape(-1))
+        if with_entropy and entropy_chunk is not None:
+            entropy_chunks.append(entropy_chunk.reshape(-1))
+
+    if log_prob_chunks:
+        log_prob_full = torch.cat(log_prob_chunks, dim=0)
+    else:
+        log_prob_full = hidden_states.new_zeros((0,), dtype=torch.float32)
+    entropy_full = None
+    if with_entropy:
+        if entropy_chunks:
+            entropy_full = torch.cat(entropy_chunks, dim=0)
+        else:
+            entropy_full = hidden_states.new_zeros((0,), dtype=torch.float32)
+
+    log_probs_list, entropy_list = _extract_per_sample(
+        log_prob_full,
+        entropy_full,
+        unconcat_tokens,
+        total_lengths,
+        response_lengths,
+        qkv_format,
+        max_seq_lens,
+        args.allgather_cp,
+    )
+
+    res = {"log_probs": log_probs_list}
+    if with_entropy:
+        res["entropy"] = entropy_list
+
+    return torch.empty((0,), device=device), res
+
+
 def get_log_probs_and_entropy(
     logits: torch.Tensor,
     *,
@@ -389,6 +488,7 @@ def get_log_probs_and_entropy(
     with_entropy: bool = False,
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
+    output_layer: torch.nn.Module | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Compute per-token log-probabilities (and optionally entropy) on responses.
 
@@ -400,6 +500,18 @@ def get_log_probs_and_entropy(
     to avoid retaining the computation graph and to skip cloning.
     """
     assert non_loss_data
+    if output_layer_uses_hidden_state_bypass(output_layer):
+        return _get_log_probs_and_entropy_from_hidden_states(
+            logits,
+            output_layer=output_layer,
+            args=args,
+            unconcat_tokens=unconcat_tokens,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            with_entropy=with_entropy,
+            max_seq_lens=max_seq_lens,
+        )
+
     qkv_format = args.qkv_format
 
     assert logits.dtype == torch.float32, f"{logits.dtype}"
@@ -479,6 +591,7 @@ def get_values(
     with_entropy: bool = False,
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
+    output_layer: torch.nn.Module | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Extract per-token value predictions over response tokens.
 
@@ -499,6 +612,7 @@ def get_values(
         Dict with key "values" mapping to a list of `[R]` value tensors
         per sample.
     """
+    del output_layer
     value_list = []
     for logits_chunk, _ in get_responses(
         logits,
@@ -787,6 +901,7 @@ def policy_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    output_layer: torch.nn.Module | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO) and metrics.
 
@@ -827,6 +942,7 @@ def policy_loss_function(
         response_lengths=response_lengths,
         with_entropy=True,
         max_seq_lens=max_seq_lens,
+        output_layer=output_layer,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1008,6 +1124,7 @@ def value_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    output_layer: torch.nn.Module | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute clipped value loss and metrics.
 
@@ -1026,6 +1143,7 @@ def value_loss_function(
         Tuple of `(loss, metrics)` where `loss` is a scalar tensor and
         `metrics` contains detached scalars "value_loss" and "value_clipfrac".
     """
+    del output_layer
     old_values = torch.cat(batch["values"], dim=0)
 
     _, values = get_values(
@@ -1066,6 +1184,7 @@ def sft_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    output_layer: torch.nn.Module | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute supervised fine-tuning loss over response tokens.
 
@@ -1094,6 +1213,7 @@ def sft_loss_function(
         response_lengths=response_lengths,
         with_entropy=False,
         max_seq_lens=batch.get("max_seq_lens", None),
+        output_layer=output_layer,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1117,6 +1237,7 @@ def loss_function(
     batch: RolloutBatch,
     num_microbatches: int,
     logits: torch.Tensor,
+    output_layer: torch.nn.Module | None = None,
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
@@ -1165,10 +1286,26 @@ def loss_function(
         case _:
             raise ValueError(f"Unknown loss type: {args.loss_type}")
 
+    supports_output_layer = "output_layer" in inspect.signature(func).parameters
+
     if args.recompute_loss_function:
-        loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean, use_reentrant=False)
+        loss, log = checkpoint(
+            lambda args_, batch_, logits_, reducer_: (
+                func(args_, batch_, logits_, reducer_, output_layer=output_layer)
+                if supports_output_layer
+                else func(args_, batch_, logits_, reducer_)
+            ),
+            args,
+            batch,
+            logits,
+            sum_of_sample_mean,
+            use_reentrant=False,
+        )
     else:
-        loss, log = func(args, batch, logits, sum_of_sample_mean)
+        if supports_output_layer:
+            loss, log = func(args, batch, logits, sum_of_sample_mean, output_layer=output_layer)
+        else:
+            loss, log = func(args, batch, logits, sum_of_sample_mean)
 
     # With allgather-CP, some CP ranks may have no loss-contributing tokens (e.g., all
     # padding). Without this, gradient doesn't flow through their attention path, so

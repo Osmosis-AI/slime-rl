@@ -154,12 +154,41 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--use-fused-moe-backward",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable the Miles-style fused MoE backward path for grouped expert modules. "
+                    "The first implementation is guarded to Bridge-based BF16 runs with "
+                    "expert-model-parallel-size == 1 and expert-tensor-parallel-size == 1."
+                ),
+            )
+            parser.add_argument(
                 "--recompute-loss-function",
                 action="store_true",
                 help="Whether to disable recompute loss function to save memory during training.",
             )
             parser.add_argument(
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
+            )
+            parser.add_argument(
+                "--use-chunked-tp-logprob-loss",
+                action="store_true",
+                default=False,
+                help=(
+                    "Phase-1 hidden-state logprob path for actor training. "
+                    "Bypasses full logits materialization on the last pipeline stage and computes TP-aware "
+                    "logprobs/loss from hidden states in sequence chunks."
+                ),
+            )
+            parser.add_argument(
+                "--chunked-tp-logprob-seq-chunk-size",
+                type=int,
+                default=256,
+                help=(
+                    "Sequence chunk size for --use-chunked-tp-logprob-loss. "
+                    "Each chunk runs the local TP output layer and TP-aware logprob computation once."
+                ),
             )
             parser.add_argument(
                 "--only-train-params-name-list",
@@ -1635,6 +1664,16 @@ def slime_validate_args(args):
             "--fp8-param-gather is incompatible with --optimizer-cpu-offload. "
             "FP8 param gather requires GPU-resident optimizer states."
         )
+
+    if args.use_fused_moe_backward:
+        if args.megatron_to_hf_mode != "bridge":
+            raise ValueError("--use-fused-moe-backward currently requires --megatron-to-hf-mode bridge.")
+        if getattr(args, "num_experts", 0) <= 0:
+            raise ValueError("--use-fused-moe-backward requires a MoE model with --num-experts > 0.")
+        if getattr(args, "expert_tensor_parallel_size", 1) != 1:
+            raise ValueError("--use-fused-moe-backward currently requires --expert-tensor-parallel-size 1.")
+        if getattr(args, "fp16", False):
+            raise ValueError("--use-fused-moe-backward only supports BF16 in the first pass.")
 
     if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
