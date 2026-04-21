@@ -55,14 +55,13 @@ def should_use_fused_selected_tp_logprob(
     with_entropy: bool,
     need_entropy_grad: bool,
 ) -> bool:
-    del with_entropy
+    del with_entropy, need_entropy_grad
     return bool(
         getattr(args, "use_fused_selected_tp_logprob", False)
         and output_layer_uses_hidden_state_bypass(output_layer)
         and output_layer is not None
         and hasattr(output_layer, "weight")
         and output_layer.weight is not None
-        and not need_entropy_grad
     )
 
 
@@ -121,6 +120,7 @@ def compute_fused_selected_tp_logprob(
     tp_group,
     rollout_temperature: float,
     with_entropy: bool,
+    need_entropy_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if not hasattr(output_layer, "weight") or output_layer.weight is None:
         raise ValueError("Fused selected TP logprob requires output_layer.weight.")
@@ -136,6 +136,7 @@ def compute_fused_selected_tp_logprob(
         tp_group=tp_group,
         rollout_temperature=rollout_temperature,
         with_entropy=with_entropy,
+        need_entropy_grad=need_entropy_grad,
     )
 
 

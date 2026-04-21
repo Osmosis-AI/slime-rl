@@ -446,6 +446,7 @@ def _get_log_probs_and_entropy_from_hidden_states(
                 tp_group=tp_group,
                 rollout_temperature=rollout_temperature,
                 with_entropy=with_entropy,
+                need_entropy_grad=need_entropy_grad,
             )
         else:
             logits_chunk = call_output_layer_linear(output_layer, hidden_chunk)

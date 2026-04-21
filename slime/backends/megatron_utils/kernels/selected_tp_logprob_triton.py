@@ -202,7 +202,7 @@ def _compute_forward_stats(
     tp_group: dist.ProcessGroup | None,
     inv_temperature: float,
     return_entropy: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if hidden_states.ndim != 2:
         raise ValueError(f"Expected hidden_states to be 2D, got {tuple(hidden_states.shape)}")
     if weight.ndim != 2:
@@ -221,7 +221,7 @@ def _compute_forward_stats(
         )
     if hidden_states.numel() == 0:
         empty = hidden_states.new_zeros((0,), dtype=torch.float32)
-        return empty, empty, empty
+        return empty, empty, empty, empty
     if not hidden_states.is_cuda or not weight.is_cuda:
         raise RuntimeError("Fused selected TP logprob Triton path requires CUDA tensors.")
 
@@ -303,12 +303,14 @@ def _compute_forward_stats(
     log_prob = selected_local - row_lse
 
     entropy = hidden_states.new_empty((0,), dtype=torch.float32)
+    row_expected_scaled = hidden_states.new_empty((0,), dtype=torch.float32)
     if return_entropy:
         global_weighted_sum = weighted_sum.sum(dim=1)
         _all_reduce_sum_(global_weighted_sum, tp_group)
-        entropy = row_lse - global_weighted_sum / global_sum
+        row_expected_scaled = global_weighted_sum / global_sum
+        entropy = row_lse - row_expected_scaled
 
-    return log_prob, entropy, row_lse
+    return log_prob, entropy, row_lse, row_expected_scaled
 
 
 class _FusedSelectedTPLogProbFunction(torch.autograd.Function):
@@ -322,10 +324,13 @@ class _FusedSelectedTPLogProbFunction(torch.autograd.Function):
         inv_temperature: float,
         tp_group: dist.ProcessGroup | None,
         return_entropy: bool,
+        need_entropy_grad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if need_entropy_grad and not return_entropy:
+            raise ValueError("need_entropy_grad=True requires return_entropy=True.")
         hidden_input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(weight.dtype)
-        log_prob, entropy, row_lse = _compute_forward_stats(
+        log_prob, entropy, row_lse, row_expected_scaled = _compute_forward_stats(
             hidden_states,
             weight,
             bias,
@@ -335,7 +340,7 @@ class _FusedSelectedTPLogProbFunction(torch.autograd.Function):
             return_entropy=return_entropy,
         )
         bias_tensor = bias if bias is not None else weight.new_empty((0,))
-        ctx.save_for_backward(hidden_states, weight, bias_tensor, tokens, row_lse)
+        ctx.save_for_backward(hidden_states, weight, bias_tensor, tokens, row_lse, row_expected_scaled)
         ctx.has_bias = bias is not None
         ctx.tp_group = tp_group
         ctx.inv_temperature = float(inv_temperature)
@@ -343,29 +348,37 @@ class _FusedSelectedTPLogProbFunction(torch.autograd.Function):
         ctx.need_hidden_grad = ctx.needs_input_grad[0]
         ctx.need_weight_grad = ctx.needs_input_grad[1]
         ctx.need_bias_grad = bias is not None and ctx.needs_input_grad[2]
-        ctx.mark_non_differentiable(entropy)
+        ctx.need_entropy_grad = bool(need_entropy_grad)
+        if not ctx.need_entropy_grad:
+            ctx.mark_non_differentiable(entropy)
         return log_prob, entropy
 
     @staticmethod
     def backward(ctx, grad_log_prob: torch.Tensor, grad_entropy: torch.Tensor | None):
-        del grad_entropy
-        hidden_states, weight, bias_tensor, tokens, row_lse = ctx.saved_tensors
+        hidden_states, weight, bias_tensor, tokens, row_lse, row_expected_scaled = ctx.saved_tensors
         bias = bias_tensor if ctx.has_bias else None
         need_hidden_grad = ctx.need_hidden_grad
         need_weight_grad = ctx.need_weight_grad
         need_bias_grad = ctx.need_bias_grad
 
-        grad_log_prob = grad_log_prob.contiguous().to(torch.float32)
-        if grad_log_prob.numel() == 0:
+        if grad_log_prob is not None:
+            grad_log_prob = grad_log_prob.contiguous().to(torch.float32)
+        if grad_entropy is not None:
+            grad_entropy = grad_entropy.contiguous().to(torch.float32)
+
+        num_rows = hidden_states.size(0)
+        if num_rows == 0:
             grad_hidden = (
                 hidden_states.new_zeros(hidden_states.shape, dtype=ctx.hidden_input_dtype) if need_hidden_grad else None
             )
             grad_weight = torch.zeros_like(weight) if need_weight_grad else None
             grad_bias = torch.zeros_like(bias) if need_bias_grad else None
-            return grad_hidden, grad_weight, grad_bias, None, None, None, None
+            return grad_hidden, grad_weight, grad_bias, None, None, None, None, None
 
         if not (need_hidden_grad or need_weight_grad or need_bias_grad):
-            return None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None
+        if grad_log_prob is None and (grad_entropy is None or not ctx.need_entropy_grad):
+            return None, None, None, None, None, None, None, None
 
         grad_hidden = (
             torch.zeros(hidden_states.shape, device=hidden_states.device, dtype=torch.float32) if need_hidden_grad else None
@@ -379,7 +392,14 @@ class _FusedSelectedTPLogProbFunction(torch.autograd.Function):
         tokens = tokens.to(torch.int64)
         row_lse = row_lse.to(torch.float32)
         row_lse = row_lse.unsqueeze(1)
-        grad_scale = grad_log_prob.unsqueeze(1) * ctx.inv_temperature
+        row_expected_scaled = row_expected_scaled.to(torch.float32)
+        row_expected_scaled = row_expected_scaled.unsqueeze(1)
+        grad_log_prob_scale = None
+        if grad_log_prob is not None:
+            grad_log_prob_scale = grad_log_prob.unsqueeze(1) * ctx.inv_temperature
+        grad_entropy_scale = None
+        if ctx.need_entropy_grad and grad_entropy is not None:
+            grad_entropy_scale = grad_entropy.unsqueeze(1) * ctx.inv_temperature
         hidden_states_fp32 = hidden_states.float() if need_weight_grad else None
 
         for tile_start in range(0, local_vocab_size, _BACKWARD_VOCAB_TILE):
@@ -391,12 +411,20 @@ class _FusedSelectedTPLogProbFunction(torch.autograd.Function):
             if ctx.inv_temperature != 1.0:
                 scaled_logits_tile.mul_(ctx.inv_temperature)
             probs_tile = torch.exp(scaled_logits_tile - row_lse)
-            grad_logits_tile = probs_tile.mul(-grad_scale)
+            grad_logits_tile = torch.zeros_like(probs_tile)
+
+            if grad_log_prob_scale is not None:
+                grad_logits_tile.add_(probs_tile.mul(-grad_log_prob_scale))
 
             local_targets = tokens - vocab_start_index - tile_start
             target_mask = (local_targets >= 0) & (local_targets < (tile_end - tile_start))
-            if target_mask.any():
-                grad_logits_tile[target_mask, local_targets[target_mask]] += grad_scale[target_mask, 0]
+            if grad_log_prob_scale is not None and target_mask.any():
+                grad_logits_tile[target_mask, local_targets[target_mask]] += grad_log_prob_scale[target_mask, 0]
+
+            if grad_entropy_scale is not None:
+                grad_logits_tile.add_(
+                    probs_tile * grad_entropy_scale * (row_expected_scaled - scaled_logits_tile)
+                )
 
             if grad_hidden is not None:
                 grad_hidden.add_(grad_logits_tile @ weight_tile.float())
@@ -410,7 +438,7 @@ class _FusedSelectedTPLogProbFunction(torch.autograd.Function):
             _all_reduce_sum_(grad_hidden, ctx.tp_group)
             grad_hidden = grad_hidden.to(ctx.hidden_input_dtype)
 
-        return grad_hidden, grad_weight, grad_bias, None, None, None, None
+        return grad_hidden, grad_weight, grad_bias, None, None, None, None, None
 
 
 def fused_selected_tp_logprob(
@@ -421,9 +449,12 @@ def fused_selected_tp_logprob(
     tp_group: dist.ProcessGroup | None,
     rollout_temperature: float,
     with_entropy: bool,
+    need_entropy_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if rollout_temperature <= 0:
         raise ValueError(f"rollout_temperature must be > 0, got {rollout_temperature}")
+    if need_entropy_grad and not with_entropy:
+        raise ValueError("need_entropy_grad=True requires with_entropy=True.")
     inv_temperature = 1.0 / float(rollout_temperature)
     log_prob, entropy = _FusedSelectedTPLogProbFunction.apply(
         hidden_states,
@@ -433,6 +464,7 @@ def fused_selected_tp_logprob(
         inv_temperature,
         tp_group,
         with_entropy,
+        need_entropy_grad,
     )
     if with_entropy:
         return log_prob, entropy
