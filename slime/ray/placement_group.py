@@ -49,17 +49,23 @@ def _create_placement_group(num_gpus):
 
     ray.get(pg.ready())
     # use info actor to get the GPU id
+    # NOTE: create + wait sequentially per bundle; creating all 16 at once on
+    # multi-node hostNetwork pods triggers a Ray scheduling bug where some
+    # bundles are stuck in PENDING_CREATION.
+    import time
     info_actors = []
+    gpu_ids = []
     for i in range(num_bundles):
-        info_actors.append(
-            InfoActor.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    placement_group_bundle_index=i,
-                )
-            ).remote()
-        )
-    gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
+        actor = InfoActor.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=i,
+            )
+        ).remote()
+        info_actors.append(actor)
+        # Eager-resolve to ensure each actor binds before the next is created.
+        gpu_ids.append(ray.get(actor.get_ip_and_gpu_id.remote(), timeout=120))
+        time.sleep(0.1)
     for actor in info_actors:
         ray.kill(actor)
 
