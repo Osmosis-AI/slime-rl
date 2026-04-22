@@ -1061,12 +1061,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="Deprecated. Ignored. slime now always uses sglang_router.",
             )
+<<<<<<< HEAD
             parser.add_argument(
                 "--slime-router-middleware-paths",
                 type=str,
                 nargs="+",
                 default="",
             )
+=======
+>>>>>>> upstream/main
             RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
             return parser
 
@@ -1130,7 +1133,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "Log statistics of the category of reward, such as why the reward function considers it as failed. "
-                    "Specify the key in the reward dict using this argument.",
+                    "Specify the key in the reward dict using this argument."
                 ),
             )
             parser.add_argument(
@@ -1336,7 +1339,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--loss-mask-type",
                 type=str,
                 default="qwen",
-                choices=["qwen", "qwen3", "distill_qwen"],
+                choices=["qwen", "qwen3", "qwen3_5", "distill_qwen"],
                 help="Loss mask type",
             )
             parser.add_argument(
