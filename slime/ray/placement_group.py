@@ -41,7 +41,10 @@ def sort_key(x):
 def _create_placement_group(num_gpus):
     """Create a placement group with the specified number of GPUs."""
     bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
-    pg = placement_group(bundles, strategy="PACK")
+    # SPREAD distributes bundles across nodes; PACK has a Ray bug on this
+    # cluster where 2/16 bundles fail to bind their placement_group_id when
+    # multi-node with hostNetwork pods.
+    pg = placement_group(bundles, strategy="SPREAD")
     num_bundles = len(bundles)
 
     ray.get(pg.ready())
