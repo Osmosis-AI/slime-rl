@@ -139,7 +139,11 @@ def get_model_provider_func(
         provider.sequence_parallel = args.sequence_parallel
         provider.context_parallel_size = args.context_parallel_size
         provider.variable_seq_lengths = args.variable_seq_lengths
+<<<<<<< HEAD
         if getattr(args, "moe_token_dispatcher_type", None) is not None:
+=======
+        if hasattr(args, "moe_token_dispatcher_type"):
+>>>>>>> upstream/main
             provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
         if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
@@ -182,7 +186,17 @@ def get_model_provider_func(
             transformer_layer_spec = import_module(args.spec)
             # Allow the spec to be a function so that user can use customized Megatron easier.
             if callable(transformer_layer_spec):
-                transformer_layer_spec = transformer_layer_spec(args, config, vp_stage)
+                result = transformer_layer_spec(args, config, vp_stage)
+                # If the result is itself a model provider (callable with pre_process param),
+                # delegate model construction to it directly (e.g. glm-omni VL model).
+                if callable(result) and "pre_process" in inspect.signature(result).parameters:
+                    model = result(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+                    if post_process and role == "critic":
+                        model.output_layer = LinearForLastLayer(
+                            input_size=config.hidden_size, output_size=1, config=config
+                        )
+                    return model
+                transformer_layer_spec = result
         else:
             if args.num_experts:
                 # Define the decoder block spec
