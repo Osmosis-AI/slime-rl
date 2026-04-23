@@ -64,8 +64,11 @@ def _create_placement_group(num_gpus):
         ).remote()
         info_actors.append(actor)
         # Eager-resolve to ensure each actor binds before the next is created.
-        gpu_ids.append(ray.get(actor.get_ip_and_gpu_id.remote(), timeout=120))
+        # Longer timeout (10min) because Ray multi-node placement is sometimes
+        # slow to schedule actors.
+        gpu_ids.append(ray.get(actor.get_ip_and_gpu_id.remote(), timeout=600))
         time.sleep(0.1)
+        logger.info(f"  InfoActor[{i}] -> node={gpu_ids[-1][0]} gpu={gpu_ids[-1][1]}")
     for actor in info_actors:
         ray.kill(actor)
 
