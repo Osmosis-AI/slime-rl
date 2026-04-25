@@ -61,10 +61,24 @@ def all_gather_param(args: Namespace, name: str, param: torch.nn.Parameter) -> t
     param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
     dist.all_gather(param_partitions, param.data, group=tp_group)
     partition_dim = param.partition_dim
+<<<<<<< HEAD
     partition_stride = param.partition_stride
 
     partition_stride, partition_dim = _check_and_fix_partition(args, name, partition_stride, partition_dim)
     param = _gather_with_stride(param_partitions, partition_dim, partition_stride)
+=======
+    assert param.partition_stride == 1, "partition_stride != 1 is not supported"
+    # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
+    # TODO: check only GLU is used.
+    if "linear_fc1.weight" in name or "linear_fc1.bias" in name:
+        param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
+        param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
+    # this is bug in megatron's grouped moe.
+    if "linear_fc2.weight" in name:
+        if partition_dim == 0:
+            partition_dim = 1
+    param = torch.cat(param_partitions, dim=partition_dim)
+>>>>>>> upstream/main
     return param
 
 
@@ -115,10 +129,25 @@ def all_gather_params_async(
         if handle is None:
             param = direct_param
         else:
+<<<<<<< HEAD
             partition_stride, partition_dim = _check_and_fix_partition(
                 args, info.name, partition_stride, partition_dim
             )
             param = _gather_with_stride(param_partitions, partition_dim, partition_stride)
+=======
+            # Process the gathered partitions (same logic as original all_gather_param)
+            assert partition_dim is not None, "partition_stride != 1 is not supported"
+            # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
+            # TODO: check only GLU is used.
+            if "linear_fc1.weight" in info.name or "linear_fc1.bias" in info.name:
+                param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
+                param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
+            # this is bug in megatron's grouped moe.
+            if "linear_fc2.weight" in info.name:
+                if partition_dim == 0:
+                    partition_dim = 1
+            param = torch.cat(param_partitions, dim=partition_dim)
+>>>>>>> upstream/main
 
         gathered_params.append(param)
 
