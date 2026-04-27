@@ -22,8 +22,7 @@ cd $BASE_DIR
 micromamba install -n slime cuda cuda-nvtx cuda-nvtx-dev nccl -c nvidia/label/cuda-12.9.1 -y
 micromamba install -n slime -c conda-forge cudnn -y
 
-# prevent installing cuda 13.0 for sglang
-pip install cuda-python==13.1.0
+pip install cuda-python==12.9
 pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu129
 
 # install sglang
@@ -51,6 +50,7 @@ NVCC_APPEND_FLAGS="--threads 4" \
 pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@dc6876905830430b5054325fa4211ff302169c6b --no-cache-dir --force-reinstall
 pip install git+https://github.com/fzyzcjy/Megatron-Bridge.git@dev_rl --no-build-isolation
 pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation
+pip install https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-5f8d397/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl --force-reinstall
 
 # megatron
 cd $BASE_DIR

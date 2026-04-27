@@ -51,7 +51,7 @@ class ServerGroup:
     all_engines: list
     num_gpus_per_engine: int
     num_new_engines: int
-    worker_type: str = "regular"  # "regular", "prefill", or "decode"
+    worker_type: str = "regular"  # "regular", "prefill", "decode", or "placeholder"
     rank_offset: int = 0  # cumulative engine count before this group
     gpu_offset: int = 0  # cumulative GPU count before this group
     sglang_overrides: dict = dataclasses.field(default_factory=dict)
@@ -114,13 +114,15 @@ class ServerGroup:
             env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
                 key: os.environ.get(key, default_val)
                 for key, default_val in {
-                    "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+                    "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "true",
+                    "SGLANG_JIT_DEEPGEMM_FAST_WARMUP": "true",
                     "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
                     "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
                     "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
                     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
                     "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+                    "SLIME_ENABLE_PROFILING": "true",
                 }.items()
             }
 
@@ -262,7 +264,7 @@ class RolloutServer:
     @property
     def nodes_per_engine(self):
         """Nodes per engine.  Only valid when all active groups share the same value."""
-        values = {g.nodes_per_engine for g in self.server_groups}
+        values = {g.nodes_per_engine for g in self.server_groups if g.worker_type != "placeholder"}
         if len(values) != 1:
             raise ValueError(f"Heterogeneous nodes_per_engine across groups: {values}")
         return values.pop()
@@ -357,8 +359,6 @@ class RolloutManager:
         self.pg = pg
         self.args = args
 
-        init_tracking(args, primary=False)
-
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
 
@@ -380,6 +380,8 @@ class RolloutManager:
         else:
             init_http_client(args)
             self.servers = start_rollout_servers(args, pg)
+
+        init_tracking(args, primary=False)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
 
@@ -391,6 +393,23 @@ class RolloutManager:
                     monitor.start()
                     self._health_monitors.append(monitor)
             self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
+
+    def _get_metrics_router_addr(self) -> str | None:
+        """Return the router address for scraping SGLang engine metrics.
+
+        The sglang_router gateway exposes ``/engine_metrics`` on its main port,
+        which aggregates Prometheus metrics from all backend sglang servers.
+        Returns ``http://{ip}:{port}`` for the first server, or ``None`` when
+        metrics are disabled or no servers are running.
+        """
+        srv = self.server
+        if srv is None or srv.router_ip is None:
+            return None
+        return f"http://{srv.router_ip}:{srv.router_port}"
+
+    def get_metrics_router_addr(self) -> str | None:
+        """Public wrapper for remote calls from the driver process."""
+        return self._get_metrics_router_addr()
 
     def _try_ci_fault_injection(self):
         """Try to inject fault during generate (when health monitor is running)."""
@@ -711,9 +730,13 @@ class RolloutManager:
             loss_masks.append(sample.loss_mask)
         train_data["loss_masks"] = loss_masks
 
-        # overwriting the raw reward
-        if samples[0].metadata and "raw_reward" in samples[0].metadata:
-            train_data["raw_reward"] = [sample.metadata["raw_reward"] for sample in samples]
+        # Overwrite raw_reward when available. Mixed-source batches may only
+        # populate this field for a subset of samples (e.g. SWE but not code).
+        if any(sample.metadata and "raw_reward" in sample.metadata for sample in samples):
+            train_data["raw_reward"] = [
+                sample.metadata["raw_reward"] if sample.metadata and "raw_reward" in sample.metadata else sample.reward
+                for sample in samples
+            ]
 
         # For rollout buffer
         if samples[0].metadata and "round_number" in samples[0].metadata:
@@ -928,7 +951,18 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
 
     if has_pd_disaggregation:
         router_args.pd_disaggregation = True
+<<<<<<< HEAD
 
+=======
+        # Disable circuit breaker to prevent RDMA transfer timeouts from
+        # marking decode workers as dead. Timeouts are transient (PCIe
+        # contention under high load) and do not indicate a dead server.
+        router_args.disable_circuit_breaker = True
+
+    # We will not use the health check from router.
+    router_args.disable_health_check = True
+
+>>>>>>> upstream/main
     logger.info(f"Launch router with args: {router_args}")
 
     process = multiprocessing.Process(
@@ -940,7 +974,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     # Wait 3 seconds
     time.sleep(3)
     assert process.is_alive()
-    logger.info(f"Router launched at {router_ip}:{router_port}")
+    logger.info(f"Router launched at {router_ip}:{router_port}, Prometheus port: {router_args.prometheus_port}")
     return router_ip, router_port
 
 
@@ -948,11 +982,7 @@ def _compute_rollout_offset(args) -> int:
     """Offset (in PG bundle slots) where rollout GPUs start."""
     if args.debug_train_only or args.debug_rollout_only or args.colocate:
         return 0
-    if args.critic_train_only:
-        return args.critic_num_nodes * args.critic_num_gpus_per_node
     offset = args.actor_num_nodes * args.actor_num_gpus_per_node
-    if args.use_critic:
-        offset += args.critic_num_nodes * args.critic_num_gpus_per_node
     return offset
 
 
@@ -960,11 +990,7 @@ def _compute_megatron_num_gpus(args) -> int:
     """Total number of megatron (actor + critic) GPU slots in the placement group."""
     if args.debug_rollout_only:
         return 0
-    if args.critic_train_only:
-        return args.critic_num_nodes * args.critic_num_gpus_per_node
     num = args.actor_num_nodes * args.actor_num_gpus_per_node
-    if args.use_critic:
-        num += args.critic_num_nodes * args.critic_num_gpus_per_node
     return num
 
 
@@ -1061,13 +1087,15 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
 
             logger.info(f"EPD phase 1 done: collected {len(encoder_urls)} encoder URLs: {encoder_urls}")
 
-            # --- Phase 2: start non-encoder groups, injecting encoder URLs into prefill ---
+            # --- Phase 2: start non-encoder groups, injecting encoder URLs into
+            # language-only LLM workers. Prefill groups use this for full EPD,
+            # while regular groups allow encoder/LLM split without PD.
             non_encoder_handles: list = []
             for group_cfg in model_cfg.server_groups:
                 if group_cfg.worker_type == "encoder":
                     continue
                 overrides_extra = {}
-                if encoder_urls and group_cfg.worker_type == "prefill":
+                if encoder_urls and group_cfg.worker_type in ("prefill", "regular"):
                     overrides_extra["language_only"] = True
                     overrides_extra["encoder_urls"] = encoder_urls
                 group = _make_group(group_cfg, router_ip, router_port, overrides_extra=overrides_extra)
