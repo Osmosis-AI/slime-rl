@@ -93,7 +93,7 @@ class LinearForLastLayer(torch.nn.Linear):
         return logits, None
 
 
-def get_model_provider_func(
+def _get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
@@ -139,7 +139,11 @@ def get_model_provider_func(
         provider.sequence_parallel = args.sequence_parallel
         provider.context_parallel_size = args.context_parallel_size
         provider.variable_seq_lengths = args.variable_seq_lengths
+<<<<<<< HEAD
         if getattr(args, "moe_token_dispatcher_type", None) is not None:
+=======
+        if hasattr(args, "moe_token_dispatcher_type"):
+>>>>>>> upstream/main
             provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
         if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
@@ -182,7 +186,17 @@ def get_model_provider_func(
             transformer_layer_spec = import_module(args.spec)
             # Allow the spec to be a function so that user can use customized Megatron easier.
             if callable(transformer_layer_spec):
-                transformer_layer_spec = transformer_layer_spec(args, config, vp_stage)
+                result = transformer_layer_spec(args, config, vp_stage)
+                # If the result is itself a model provider (callable with pre_process param),
+                # delegate model construction to it directly (e.g. glm-omni VL model).
+                if callable(result) and "pre_process" in inspect.signature(result).parameters:
+                    model = result(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+                    if post_process and role == "critic":
+                        model.output_layer = LinearForLastLayer(
+                            input_size=config.hidden_size, output_size=1, config=config
+                        )
+                    return model
+                transformer_layer_spec = result
         else:
             if args.num_experts:
                 # Define the decoder block spec
@@ -271,13 +285,25 @@ def get_model_provider_func(
 
 
 def wrap_model_provider_with_freeze(original_provider, args):
+<<<<<<< HEAD
     def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None):
+=======
+    def wrapped_provider(
+        pre_process=True,
+        post_process=True,
+        **kwargs,
+    ):
+>>>>>>> upstream/main
         sig = inspect.signature(original_provider)
-        if "vp_stage" in sig.parameters:
-            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        else:
-            model = original_provider(pre_process=pre_process, post_process=post_process)
+        provider_kwargs = {
+            "pre_process": pre_process,
+            "post_process": post_process,
+        }
+        for key in ["vp_stage", "config", "pg_collection"]:
+            if key in sig.parameters:
+                provider_kwargs[key] = kwargs.get(key, None)
 
+        model = original_provider(**provider_kwargs)
         freeze_model_params(model, args)
 
         return model
@@ -285,8 +311,12 @@ def wrap_model_provider_with_freeze(original_provider, args):
     return wrapped_provider
 
 
+def get_model_provider_func(args, role="actor"):
+    return wrap_model_provider_with_freeze(_get_model_provider_func(args, role), args)
+
+
 def freeze_model_params(model: GPTModel, args: argparse.Namespace):
-    if args.only_train_params_name_list:
+    if getattr(args, "only_train_params_name_list", None):
         for name, param in model.named_parameters():
             param.requires_grad = False
             for pattern in args.only_train_params_name_list:
@@ -294,7 +324,7 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace):
                     param.requires_grad = True
                     break
 
-    if args.freeze_params_name_list:
+    if getattr(args, "freeze_params_name_list", None):
         for name, param in model.named_parameters():
             for pattern in args.freeze_params_name_list:
                 if re.search(pattern, name):
