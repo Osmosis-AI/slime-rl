@@ -18,7 +18,7 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_model_config, unwrap_model
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
@@ -30,9 +30,71 @@ from .checkpoint import load_checkpoint, save_checkpoint, save_checkpoint_with_l
 from .data import DataIterator, get_batch
 from .lora_utils import is_lora_enabled, is_lora_model, save_lora_checkpoint
 from .loss import loss_function
-from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
+from .model_provider import get_model_provider_func
 
 logger = logging.getLogger(__name__)
+
+
+def _iter_critic_output_layers(model: Sequence[DDP]):
+    for chunk_id, module in enumerate(unwrap_model(model)):
+        output_layer = getattr(module, "output_layer", None)
+        if output_layer is not None:
+            yield chunk_id, output_layer
+
+
+def _critic_output_layer_needs_reinit(args: Namespace, model: Sequence[DDP], role: str) -> bool:
+    if role != "critic" or args.load is None:
+        return False
+
+    from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
+    from megatron.training.checkpointing import get_load_checkpoint_path_by_args
+
+    checkpoint_path = Path(get_load_checkpoint_path_by_args(args))
+    if not (checkpoint_path / ".metadata").is_file():
+        return False
+
+    checkpoint_metadata = load_tensors_metadata(str(checkpoint_path))
+    for _chunk_id, output_layer in _iter_critic_output_layers(model):
+        for name in ("weight", "bias"):
+            param = getattr(output_layer, name, None)
+            if param is None:
+                continue
+
+            param_name = f"output_layer.{name}"
+            ckpt_tensor_metadata = next(
+                (
+                    tensor_metadata
+                    for key, tensor_metadata in checkpoint_metadata.items()
+                    if key == param_name or key.endswith(f".{param_name}")
+                ),
+                None,
+            )
+            expected_shape = tuple(param.shape)
+            checkpoint_shape = tuple(ckpt_tensor_metadata.global_shape) if ckpt_tensor_metadata is not None else None
+            if checkpoint_shape == expected_shape:
+                continue
+
+            reason = (
+                "missing from checkpoint metadata"
+                if checkpoint_shape is None
+                else f"shape mismatch checkpoint={checkpoint_shape} runtime={expected_shape}"
+            )
+            logger.warning(
+                "Will reinitialize critic %s after checkpoint load because it is %s",
+                param_name,
+                reason,
+            )
+            return True
+
+    return False
+
+
+@torch.no_grad()
+def _reinitialize_critic_output_layer(model: Sequence[DDP]) -> None:
+    for _chunk_id, output_layer in _iter_critic_output_layers(model):
+        output_layer.weight.data.normal_(mean=0.0, std=0.02)
+        if output_layer.bias is not None:
+            output_layer.bias.data.zero_()
 
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
@@ -107,12 +169,16 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
+<<<<<<< HEAD
     if is_lora_enabled(args) and role == "actor" and args.megatron_to_hf_mode == "bridge":
         model = _setup_lora_model_via_bridge(args)
     else:
         model = get_model(
             wrap_model_provider_with_freeze(get_model_provider_func(args, role), args), ModelType.encoder_or_decoder
         )
+=======
+    model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
+>>>>>>> upstream/main
 
     # Optimizer
     kwargs = {}
@@ -229,15 +295,17 @@ def forward_only(
         packed_seq_params = batch["packed_seq_params"]
         total_lengths = batch["total_lengths"]
         response_lengths = batch["response_lengths"]
-        output_tensor = model(
-            input_ids=tokens,
-            position_ids=None,
-            attention_mask=None,
-            labels=None,
-            packed_seq_params=packed_seq_params,
-            loss_mask=batch["full_loss_masks"],
-            **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
-        )
+        forward_kwargs = {
+            "input_ids": tokens,
+            "position_ids": None,
+            "attention_mask": None,
+            "labels": None,
+            "packed_seq_params": packed_seq_params,
+            "loss_mask": batch["full_loss_masks"],
+        }
+        if batch["multimodal_train_inputs"] is not None:
+            forward_kwargs.update(batch["multimodal_train_inputs"])
+        output_tensor = model(**forward_kwargs)
 
         return output_tensor, partial(
             f,
@@ -389,9 +457,10 @@ def train_one_step(
 
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
+            position_ids = None
             output_tensor = model.build_schedule_plan(
                 input_ids=batch["tokens"],
-                position_ids=None,
+                position_ids=position_ids,
                 attention_mask=None,
                 labels=None,
                 packed_seq_params=batch["packed_seq_params"],
@@ -407,11 +476,11 @@ def train_one_step(
                 "loss_mask": batch["full_loss_masks"],
             }
 
-            if args.enable_mtp_training:
-                forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
-
             if batch["multimodal_train_inputs"] is not None:
                 forward_kwargs.update(batch["multimodal_train_inputs"])
+
+            if args.enable_mtp_training:
+                forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
 
             output_tensor = model(**forward_kwargs)
 
@@ -434,6 +503,7 @@ def train_one_step(
     )
 
     valid_step = True
+    grad_norm = float("nan")
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
         found_inf_flag = optimizer.prepare_grads()
         if found_inf_flag:
@@ -739,6 +809,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
 
     try:
         from megatron.bridge import AutoBridge
+
         from slime.utils.megatron_bridge_utils import patch_megatron_model
 
         path = Path(args.save_hf.format(rollout_id=rollout_id))
@@ -788,6 +859,7 @@ def initialize_model_and_optimizer(
 
     if torch.version.hip:
         import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
+
         from slime.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync
 
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
@@ -795,6 +867,7 @@ def initialize_model_and_optimizer(
 
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
+    reinit_critic_output_layer = _critic_output_layer_needs_reinit(args, model, role)
     clear_memory()
     iteration, _ = load_checkpoint(
         model,
@@ -803,8 +876,13 @@ def initialize_model_and_optimizer(
         checkpointing_context={},
         skip_load_to_model_and_opt=False,
     )
+    if reinit_critic_output_layer:
+        _reinitialize_critic_output_layer(model)
+        if (args.fp16 or args.bf16) and optimizer is not None:
+            optimizer.reload_model_params()
     clear_memory()
 
+<<<<<<< HEAD
     if (mpu.get_data_parallel_rank(with_context_parallel=True) == 0
             and mpu.get_tensor_model_parallel_rank() == 0
             and mpu.is_pipeline_last_stage()):
@@ -822,4 +900,6 @@ def initialize_model_and_optimizer(
 
     opt_param_scheduler.step(increment=iteration * args.global_batch_size)
 
+=======
+>>>>>>> upstream/main
     return model, optimizer, opt_param_scheduler, iteration

@@ -1,5 +1,4 @@
 import logging
-
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
 from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
@@ -12,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron validations."""
+
     _megatron_validate_args(args)
 
     # always use varlen
@@ -56,6 +56,7 @@ def _hf_validate_args(args, hf_config):
         ("intermediate_size", "ffn_hidden_size", equal),
         ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
         ("rms_norm_eps", "norm_epsilon", equal),
+        ("rms_norm_eps", "layernorm_epsilon", equal),
     ]:
         if hasattr(hf_config, hf_config_name) and hasattr(args, megatron_config_name):
             if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
@@ -117,9 +118,6 @@ def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
         _hf_validate_args(args, hf_config)
 
     args.rank = 0
-    if args.critic_train_only:
-        args.world_size = args.critic_num_nodes * args.critic_num_gpus_per_node
-    else:
-        args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+    args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
     args = _set_default_megatron_args(args)
     return args
