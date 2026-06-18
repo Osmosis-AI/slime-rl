@@ -166,13 +166,16 @@ def log_samples(samples: list, step: int | None = None) -> None:
             "output": sample.response,
             "score": sample.reward,
         }
+        metadata = getattr(sample, "metadata", None)
+        if metadata:
+            entry["metadata"] = metadata
         row_data.append(entry)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         filename = f"rollout_step{step}.json" if step is not None else "rollout.json"
         artifact_path = Path(tmp_dir) / filename
         with open(artifact_path, "w") as f:
-            json.dump(row_data, f, indent=2)
+            json.dump(row_data, f, indent=2, default=str)
         mlflow.log_artifact(str(artifact_path), artifact_path="rollout_samples")
 
 
